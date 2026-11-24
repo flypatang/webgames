@@ -34,7 +34,7 @@ Gnomes target the critter **furthest along the path** within range.
 
 ## Critters (waves)
 - Wave w composition from a table (and a formula after wave 10): Slug (HP 4, speed 1.0 cells/s, 1 seed), Beetle (HP 10, speed 0.7, armored: −0.5 per hit, min 0.3, 2 seeds), Hare (HP 3, speed 2.0, 2 seeds), Mole (HP 8, speed 0.9, from wave 6: ignores hedges, BFS-paths through hedges but around gnomes, 3 seeds), Boss Badger every 5th wave (base HP 40 + 30·(w/5−1), then the wave HP scale; speed 0.5, 15 seeds).
-- HP scale per wave: × 1.11^(w−1). Armor: a flat −0.5 per hit, with a 0.3 floor. Count: 8 + 2w (max 40) for normal waves. Spawn interval 0.8 s.
+- HP scale per wave: × G^(w−1), with G ≈ 1.28, calibrated within [1.22, 1.35] by the seeded harness so the incremental-maze strategy has a median wave of 14–18 and no-maze a median ≤ 9. Armor: a flat −0.5 per hit, with a 0.3 floor. Count: 8 + 2w (max 40) for normal waves. Spawn interval 0.8 s.
 - Waves 1–10 table: 1 slugs; 2 slugs; 3 slugs+hares; 4 beetles+slugs; 5 boss + slugs; 6 moles+slugs; 7 hares+beetles; 8 mixed; 9 beetles+moles; 10 boss + mixed. After 10: a random mix, weighted by the unlocked types.
 
 ## Economy
