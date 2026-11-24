@@ -15,7 +15,7 @@ The orchestrator never writes game code. The reviewer never edits files.
 3. **Build**: the Haiku builder implements `games/<slug>/index.html` and runs `node tools/smoke.js games/<slug>` until it passes.
 4. **Review**: the Sonnet reviewer reads the spec and code, runs the smoke test, and returns `PASS` or `FAIL` with a numbered fix list.
 5. **Fix loop**: on FAIL, the Haiku builder applies the fix list, then step 4 runs again. Stop after 3 rounds and escalate to the orchestrator.
-6. **Ship**: the orchestrator updates `IDEAS.md`, regenerates the gallery (`node tools/gallery.js`) and commits `game: <slug> — <title>`.
+6. **Ship**: the orchestrator updates `IDEAS.md`, regenerates the gallery from committed files only (run `node tools/gallery.js` in a clean `git worktree` of HEAD, so in-progress games are not listed) and commits `game: <slug> — <title>`.
 
 ## Technical standards (every game)
 - One self-contained `index.html`: vanilla JS + `<canvas>`, inline CSS/JS, **no external requests** (no CDNs, fonts, images). Art is procedural or drawn shapes; sound uses WebAudio synthesis (muted until the first user input).
