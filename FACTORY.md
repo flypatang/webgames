@@ -31,7 +31,7 @@ The orchestrator never writes game code. The reviewer never edits files.
 - Expose `window.__game = { state, score }` (kept updated) so the smoke test can observe it.
 - Target size is under 1500 lines; readable, with sections commented.
 
-- Balance claims need evidence: a seeded, deterministic harness (call the update function directly with a seeded RNG) and ≥ 20 runs per configuration. A handful of real-time bot runs proves nothing. Before blaming the game, check whether a bot's strategy is just weak.
+- Balance claims need evidence: a seeded, deterministic harness (call the update function directly with a seeded RNG) and ≥ 20 runs per configuration. A handful of real-time bot runs proves nothing. Before blaming the game, check whether a bot's strategy is just weak: prefer a competent planner (search/lookahead on the deterministic sim, used as an upper bound) over a simple heuristic, and never retune the game to fit a weak bot.
 
 ## Quality bar (the reviewer judges this)
 - Clear goal within 5 seconds, a satisfying core loop, and difficulty that ramps.
