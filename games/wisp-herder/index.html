@@ -1,0 +1,1102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<link rel="icon" href="data:,">
+<title>Wisp Herder</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #03060c; overflow: hidden; }
+  body { -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+  canvas { position: fixed; left: 0; top: 0; display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* ==========================================================================
+   WISP HERDER
+   Single-file canvas game. Logical field 800x600 (landscape) or 600x800
+   (portrait), scaled and letterboxed to the window.
+   Sections: 1 config · 2 state & layout · 3 audio · 4 night setup · 5 flock
+             6 moths & keeper · 7 rules & flow · 8 input · 9 rendering · 10 loop
+   ========================================================================== */
+
+/* ---------- 1. CONFIG ---------- */
+const STEP = 1 / 60;                          // fixed simulation step (s)
+const TAU = Math.PI * 2;
+const KEEPER_R = 12, KEEPER_SPEED = 170, KEEPER_REACH = 6, REPEL_R = 110;
+const FLARE_CD = 3, FLARE_R = 200, FLARE_V = 260, FLARE_STUN = 2;
+const WISP_R = 5, WISP_MAX_V = 90, WISP_MAX_F = 140;
+const SEP_R = 18, ALI_R = 50, COH_R = 60;
+const W_SEP = 1.6, W_ALI = 0.8, W_COH = 0.7, W_WANDER = 0.3, W_EDGE = 1.5, W_REPEL = 2.5;
+const EDGE_R = 30;
+const GATE_LEN = 120, GATE_DEPTH = 60;
+const SAVE_PTS = 10;
+const MOTH_R = 9, MOTH_V = 60, MOTH_REPEL = 3.0, MOTH_KILL_R = MOTH_R + WISP_R;
+const MOTH_FEED = 2.5, MOTH_FEED_STUN = 4, FEAR_R = 70, FEAR_W = 1.8;   // feeding time, stun when fed on, wisp fear
+const MOTH_RESPAWN = 4, MOTH_DELAY = 2, MAX_MOTHS = 5;
+const PASS_FRAC = 0.6, TIME_BONUS = 5, PERFECT_BONUS = 100;
+const WIND_START_NIGHT = 4, WIND_EVERY = 10, WIND_DUR = 2, WIND_V = 40;
+const SPAWN_R = 80, SPAWN_DEPTH = 0.78, SPAWN_CLEAR = 90, SHRINE_CLEAR = 90;
+const MAX_WISPS = 40;
+const STUCK_V = 5, STUCK_T = 2.5, NUDGE_V = 60;
+const GUARD_T = 0.6;                          // s before summary/game-over accept input
+const BEST_KEY = 'wispHerder.best';
+const EDGES = ['left', 'top', 'right', 'bottom'];
+const EDGE_DEF = {
+  left:   { nx: 1,  ny: 0,  tx: 0, ty: 1 },   // nx,ny = inward normal; tx,ty = tangent
+  right:  { nx: -1, ny: 0,  tx: 0, ty: 1 },
+  top:    { nx: 0,  ny: 1,  tx: 1, ty: 0 },
+  bottom: { nx: 0,  ny: -1, tx: 1, ty: 0 },
+};
+const CTRL = {
+  KeyW: 'up', ArrowUp: 'up', KeyS: 'down', ArrowDown: 'down',
+  KeyA: 'left', ArrowLeft: 'left', KeyD: 'right', ArrowRight: 'right',
+};
+const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
+
+/* ---------- 2. STATE & LAYOUT ---------- */
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const rand = (a, b) => a + Math.random() * (b - a);
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const lightCv = document.createElement('canvas');   // darkness overlay buffer
+const lctx = lightCv.getContext('2d');
+
+let W = 800, H = 600;                         // logical field (set by layout)
+let DPR = 1, SC = 1, OX = 0, OY = 0;          // device scale, fit scale, letterbox offset (CSS px)
+const view = { scale: 1, ox: 0, oy: 0 };      // exposed for the test bot (CSS px)
+
+// Fits the field to the window. Returns true when the logical size changed.
+function layout() {
+  const vw = window.innerWidth, vh = window.innerHeight;
+  const portrait = vh > vw;
+  const nW = portrait ? 600 : 800, nH = portrait ? 800 : 600;
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  cv.width = Math.round(vw * DPR);
+  cv.height = Math.round(vh * DPR);
+  cv.style.width = vw + 'px';
+  cv.style.height = vh + 'px';
+  lightCv.width = cv.width;
+  lightCv.height = cv.height;
+  SC = Math.min(vw / nW, vh / nH);
+  OX = (vw - nW * SC) / 2;
+  OY = (vh - nH * SC) / 2;
+  view.scale = SC; view.ox = OX; view.oy = OY;
+  const changed = nW !== W || nH !== H;
+  W = nW; H = nH;
+  return changed;
+}
+// Maps logical coordinates to device pixels (sx, sy = shake offset in logical units).
+function setView(c, sx, sy) {
+  c.setTransform(DPR * SC, 0, 0, DPR * SC, DPR * (OX + sx), DPR * (OY + sy));
+}
+
+// Game state. state: title | playing | paused | summary | over
+let state = 'title';
+let night = 1, N = 12, needed = 8, timeLeft = 65, saved = 0, lost = 0;
+let score = 0, best = loadBest();
+let demo = false, demoT = 0;
+let gate = null, walls = [], spawnC = { x: 0, y: 0 }, lastEdge = null;
+let obstacles = [], wisps = [], moths = [], pendingMoths = [];
+let keeper = { x: 0, y: 0, vx: 0, vy: 0, fcd: 0 };
+let endT = -1, guard = 0, banner = 0;
+let windTimer = WIND_EVERY, windNext = null, windDir = 0, windLeft = 0;
+let summary = null, nudges = 0, elapsed = 0;
+let particles = [], rings = [], floaters = [];
+let shake = { t: 0, m: 0 };
+let grass = null;
+let keys = {}, ptrId = null, ptrTarget = null, lastTapT = 0, lastTapX = 0, lastTapY = 0;
+let frameMs = 0;
+
+// Exposed for the smoke test and debugging; kept current every frame.
+const game = window.__game = {
+  state, score, best, night: 1, N: 0, needed: 0, saved: 0, lost: 0, timeLeft: 0,
+  flareCd: 0, keeper, wisps, moths, obstacles, gate: null, W, H, view, nudges: 0, frameMs: 0,
+};
+function syncGame() {
+  game.state = state; game.score = score; game.best = best; game.night = night;
+  game.N = N; game.needed = needed; game.saved = saved; game.lost = lost;
+  game.timeLeft = timeLeft; game.flareCd = keeper.fcd; game.keeper = keeper;
+  game.wisps = wisps; game.moths = moths; game.obstacles = obstacles;
+  game.gate = gate ? { edge: gate.edge, ex: gate.ex, ey: gate.ey } : null;
+  game.W = W; game.H = H; game.nudges = nudges; game.frameMs = frameMs;
+}
+
+function loadBest() {
+  try {
+    const v = parseInt(localStorage.getItem(BEST_KEY) || '0', 10);
+    return isFinite(v) && v > 0 ? v : 0;
+  } catch (e) { return 0; }
+}
+function saveBest() {
+  try { localStorage.setItem(BEST_KEY, String(best)); } catch (e) { /* storage blocked: ignore */ }
+}
+function addScore(n) {
+  score += n;
+  if (score > best) best = score;
+}
+
+/* ---------- 3. AUDIO (WebAudio synthesis, created on first input) ---------- */
+let AC = null, master = null, noiseBuf = null;
+function ensureAudio() {
+  try {
+    if (!AC) {
+      const Ctor = window.AudioContext || window.webkitAudioContext;
+      if (!Ctor) return;
+      AC = new Ctor();
+      master = AC.createGain();
+      master.gain.value = 0.25;
+      master.connect(AC.destination);
+      const len = Math.floor(AC.sampleRate * 0.5);
+      noiseBuf = AC.createBuffer(1, len, AC.sampleRate);
+      const d = noiseBuf.getChannelData(0);
+      for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+    }
+    if (AC.state === 'suspended') AC.resume();
+  } catch (e) { AC = null; }
+}
+function tone(f, dur, type, vol, when = 0, slideTo = null) {
+  if (!AC) return;
+  try {
+    const t0 = AC.currentTime + when;
+    const o = AC.createOscillator(), g = AC.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(f, t0);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t0 + dur);
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(vol, t0 + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    o.connect(g); g.connect(master);
+    o.start(t0); o.stop(t0 + dur + 0.05);
+  } catch (e) { /* audio unavailable */ }
+}
+function noise(dur, f0, f1, vol) {
+  if (!AC) return;
+  try {
+    const t0 = AC.currentTime;
+    const src = AC.createBufferSource(); src.buffer = noiseBuf;
+    const bp = AC.createBiquadFilter(); bp.type = 'bandpass'; bp.Q.value = 1.2;
+    bp.frequency.setValueAtTime(f0, t0);
+    bp.frequency.exponentialRampToValueAtTime(f1, t0 + dur);
+    const g = AC.createGain();
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(vol, t0 + 0.05);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    src.connect(bp); bp.connect(g); g.connect(master);
+    src.start(t0); src.stop(t0 + dur + 0.05);
+  } catch (e) { /* audio unavailable */ }
+}
+const sfx = {
+  chime(n) {                                  // rising pentatonic note by count
+    const steps = [0, 2, 4, 7, 9];
+    const oct = Math.min(2, Math.floor(n / 5));
+    const f = 660 * Math.pow(2, (steps[n % 5] + 12 * oct) / 12);
+    tone(f, 0.45, 'sine', 0.18);
+    tone(f * 2, 0.3, 'sine', 0.05, 0.02);
+  },
+  thud() { tone(120, 0.3, 'sine', 0.35, 0, 45); },
+  whoosh() { noise(0.4, 300, 2400, 0.3); },
+  chord() { [262, 330, 392].forEach((f, i) => tone(f, 1.2, 'triangle', 0.12, i * 0.06)); },
+  fail() { tone(196, 0.7, 'sawtooth', 0.06, 0, 98); },
+};
+
+/* ---------- 4. NIGHT SETUP ---------- */
+function nightParams(n) {
+  return {
+    N: Math.min(MAX_WISPS, 12 + 4 * (n - 1)),
+    moths: Math.min(MAX_MOTHS, n - 1),
+    obstacles: Math.min(6, 3 + Math.floor(n / 2)),
+    time: 70 + 5 * n,
+  };
+}
+// Wall segment on one edge: centre (ex,ey), inward normal (nx,ny), tangent (tx,ty).
+function makeWall(edge, isGate) {
+  const ex = edge === 'left' ? 0 : edge === 'right' ? W : W / 2;
+  const ey = edge === 'top' ? 0 : edge === 'bottom' ? H : H / 2;
+  return { edge, ex, ey, ...EDGE_DEF[edge], gate: isGate };
+}
+// Coordinates relative to a wall: dn = distance inward, dt = offset along the wall.
+function localTo(w, x, y) {
+  const ux = x - w.ex, uy = y - w.ey;
+  return { dn: ux * w.nx + uy * w.ny, dt: ux * w.tx + uy * w.ty };
+}
+function inZone(x, y) {
+  const l = localTo(gate, x, y);
+  return l.dn >= 0 && l.dn <= GATE_DEPTH && Math.abs(l.dt) <= GATE_LEN / 2;
+}
+// Distance from a point to the shrine zone rectangle (0 when inside).
+function zoneDist(x, y) {
+  const l = localTo(gate, x, y);
+  const cn = clamp(l.dn, 0, GATE_DEPTH), ct = clamp(l.dt, -GATE_LEN / 2, GATE_LEN / 2);
+  return Math.hypot(l.dn - cn, l.dt - ct);
+}
+function placeObstacles(count) {
+  const out = [];
+  for (let tries = 0; tries < 800 && out.length < count; tries++) {
+    const r = rand(20, 45);
+    const x = rand(r + 10, W - r - 10), y = rand(r + 10, H - r - 10);
+    if (zoneDist(x, y) < r + SHRINE_CLEAR) continue;
+    if (Math.hypot(x - spawnC.x, y - spawnC.y) < r + SPAWN_R + SPAWN_CLEAR) continue;
+    if (Math.hypot(x - W / 2, y - H / 2) < r + KEEPER_R + 40) continue;
+    if (out.some(o => Math.hypot(x - o.x, y - o.y) < r + o.r + 20)) continue;
+    out.push({ x, y, r });
+  }
+  return out;
+}
+function newWisp(x, y) {
+  const a = Math.random() * TAU, s = Math.random() * 30;
+  return {
+    x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s,
+    wa: Math.random() * TAU, phase: Math.random() * TAU, a0: 0,
+    st: 'flock', t: 0, still: 0, alpha: 1, trail: [],
+  };
+}
+function spawnWisps(count) {
+  wisps = [];
+  for (let i = 0; i < count; i++) {
+    let x = 0, y = 0;
+    for (let tries = 0; tries < 40; tries++) {
+      const a = Math.random() * TAU, rr = Math.sqrt(Math.random()) * SPAWN_R;
+      x = clamp(spawnC.x + Math.cos(a) * rr, WISP_R, W - WISP_R);
+      y = clamp(spawnC.y + Math.sin(a) * rr, WISP_R, H - WISP_R);
+      if (!obstacles.some(o => Math.hypot(x - o.x, y - o.y) < o.r + WISP_R + 2)) break;
+    }
+    wisps.push(newWisp(x, y));
+  }
+}
+function pickEdge() {
+  const opts = EDGES.filter(e => e !== lastEdge);
+  return opts[Math.floor(Math.random() * opts.length)];
+}
+function setupNight(n) {
+  const p = nightParams(n);
+  night = n; N = p.N;
+  needed = Math.ceil(PASS_FRAC * N - 1e-9);
+  timeLeft = p.time; saved = 0; lost = 0; endT = -1; nudges = 0;
+  const edge = pickEdge();
+  lastEdge = edge;
+  gate = makeWall(edge, true);
+  walls = EDGES.map(e => (e === edge ? gate : makeWall(e, false)));
+  const depth = (edge === 'left' || edge === 'right') ? W : H;
+  spawnC = { x: gate.ex + gate.nx * SPAWN_DEPTH * depth, y: gate.ey + gate.ny * SPAWN_DEPTH * depth };
+  obstacles = placeObstacles(p.obstacles);
+  spawnWisps(N);
+  moths = [];
+  pendingMoths = demo ? [] : Array.from({ length: p.moths }, () => MOTH_DELAY);
+  keeper = { x: W / 2, y: H / 2, vx: 0, vy: 0, fcd: 0 };
+  windTimer = WIND_EVERY; windNext = null; windLeft = 0;
+  particles = []; rings = []; floaters = [];
+  banner = 1.8;
+}
+// Title-screen backdrop: a flock circling behind the title, no scoring.
+function setupDemo() {
+  demo = true;
+  setupNight(1);
+  demoT = 0;
+}
+// Orientation change mid-night: moves every entity proportionally from the old field
+// size to the new one. Timer, saved/lost counts, score and wind state are untouched.
+function remapField(oldW, oldH) {
+  const sx = W / oldW, sy = H / oldH, sr = Math.sqrt(sx * sy);   // sr keeps obstacle area
+  for (const o of obstacles) {
+    o.x *= sx; o.y *= sy; o.r *= sr;
+    o.x = clamp(o.x, o.r, W - o.r); o.y = clamp(o.y, o.r, H - o.r);
+  }
+  spawnC.x *= sx; spawnC.y *= sy;
+  if (gate) {                                 // same edge; the gate stays centred on it
+    gate = makeWall(gate.edge, true);
+    walls = EDGES.map(e => (e === gate.edge ? gate : makeWall(e, false)));
+  }
+  keeper.x *= sx; keeper.y *= sy; keeper.vx *= sx; keeper.vy *= sy;
+  pushOut(keeper, KEEPER_R); clampField(keeper, KEEPER_R);
+  for (const w of wisps) {
+    w.x *= sx; w.y *= sy; w.vx *= sx; w.vy *= sy;
+    for (const p of w.trail) { p.x *= sx; p.y *= sy; }
+    if (w.st === 'flock') pushOut(w, WISP_R);
+    clampField(w, WISP_R);
+  }
+  for (const m of moths) {
+    m.x *= sx; m.y *= sy; m.vx *= sx; m.vy *= sy; m.kx *= sx; m.ky *= sy;
+    m.x = clamp(m.x, MOTH_R, W - MOTH_R); m.y = clamp(m.y, MOTH_R, H - MOTH_R);
+  }
+  for (const p of particles) { p.x *= sx; p.y *= sy; }
+  for (const r of rings) { r.x *= sx; r.y *= sy; }
+  for (const f of floaters) { f.x *= sx; f.y *= sy; }
+}
+
+/* ---------- 5. FLOCK (boids + keeper repel + edges + obstacles) ---------- */
+const F = { x: 0, y: 0 };                     // steering accumulator
+function addSteer(w, dx, dy, weight) {
+  const m = Math.hypot(dx, dy);
+  if (m < 1e-6 || weight <= 0) return;
+  F.x += weight * ((dx / m) * WISP_MAX_V - w.vx);
+  F.y += weight * ((dy / m) * WISP_MAX_V - w.vy);
+}
+function stepFlockWisp(w, flock, dt) {
+  F.x = 0; F.y = 0;
+  let sx = 0, sy = 0, ax = 0, ay = 0, an = 0, cx = 0, cy = 0, cn = 0;
+  for (const o of flock) {
+    if (o === w) continue;
+    const dx = w.x - o.x, dy = w.y - o.y, d2 = dx * dx + dy * dy;
+    if (d2 < COH_R * COH_R) {
+      cx += o.x; cy += o.y; cn++;
+      if (d2 < ALI_R * ALI_R) { ax += o.vx; ay += o.vy; an++; }
+      if (d2 < SEP_R * SEP_R) { const inv = 1 / (d2 + 0.5); sx += dx * inv; sy += dy * inv; }
+    }
+  }
+  addSteer(w, sx, sy, W_SEP);
+  if (an) addSteer(w, ax, ay, W_ALI);
+  if (cn) addSteer(w, cx / cn - w.x, cy / cn - w.y, W_COH);
+  w.wa += rand(-3, 3) * dt;
+  addSteer(w, Math.cos(w.wa), Math.sin(w.wa), W_WANDER);
+  for (const wl of walls) {
+    const l = localTo(wl, w.x, w.y);
+    if (wl.gate && Math.abs(l.dt) <= GATE_LEN / 2) continue;   // the shrine gap is open
+    if (l.dn < EDGE_R) addSteer(w, wl.nx, wl.ny, W_EDGE * (1 - Math.max(0, l.dn) / EDGE_R));
+  }
+  const kx = w.x - keeper.x, ky = w.y - keeper.y, kd = Math.hypot(kx, ky);
+  if (kd < REPEL_R) { const s = 1 - kd / REPEL_R; addSteer(w, kx, ky, W_REPEL * s * s); }
+  for (const m of moths) {                    // wisps fear moths within 70 px
+    if (!m.gone && Math.hypot(w.x - m.x, w.y - m.y) < FEAR_R) addSteer(w, w.x - m.x, w.y - m.y, FEAR_W);
+  }
+  const fm = Math.hypot(F.x, F.y);
+  if (fm > WISP_MAX_F) { F.x *= WISP_MAX_F / fm; F.y *= WISP_MAX_F / fm; }
+  w.vx += F.x * dt; w.vy += F.y * dt;
+  // Flare impulses above max speed decay back toward it.
+  const sp0 = Math.hypot(w.vx, w.vy);
+  if (sp0 > WISP_MAX_V) {
+    const k = (WISP_MAX_V + (sp0 - WISP_MAX_V) * Math.exp(-3 * dt)) / sp0;
+    w.vx *= k; w.vy *= k;
+  }
+  w.x += w.vx * dt; w.y += w.vy * dt;
+  pushOut(w, WISP_R);
+  clampField(w, WISP_R);
+  // Anti-stuck safety net: a wisp that barely moves for 2.5 s gets a random nudge.
+  const sp = Math.hypot(w.vx, w.vy);
+  if (sp < STUCK_V) {
+    w.still += dt;
+    if (w.still > STUCK_T) {
+      const a = Math.random() * TAU;
+      w.vx += Math.cos(a) * NUDGE_V; w.vy += Math.sin(a) * NUDGE_V;
+      w.still = 0; nudges++;
+    }
+  } else w.still = 0;
+  w.trail.push({ x: w.x, y: w.y });
+  if (w.trail.length > 5) w.trail.shift();
+  if (!demo && inZone(w.x, w.y)) saveWisp(w);
+}
+function stepWisps(dt) {
+  const flock = wisps.filter(w => w.st === 'flock');
+  for (const w of flock) stepFlockWisp(w, flock, dt);
+  for (const w of wisps) if (w.st !== 'flock') stepFading(w, dt);
+  wisps = wisps.filter(w => w.st === 'flock' || w.t < (w.st === 'saved' ? 0.9 : 1.2));
+}
+function saveWisp(w) {
+  w.st = 'saved'; w.t = 0; w.alpha = 1;
+  w.a0 = Math.atan2(w.y - (gate.ey + gate.ny * 30), w.x - (gate.ex + gate.nx * 30));
+  saved++;
+  addScore(SAVE_PTS);
+  sfx.chime(saved - 1);
+  burst(w.x, w.y, '#8fffc1', 10, 60, 0.6);
+  floaters.push({ x: w.x, y: w.y, text: '+' + SAVE_PTS, life: 0.8, max: 0.8, color: '#8fffc1' });
+}
+function loseWisp(w, from) {
+  w.st = 'lost'; w.t = 0; lost++;
+  const a = from ? Math.atan2(w.y - from.y, w.x - from.x) : Math.random() * TAU;
+  w.vx = Math.cos(a) * 120; w.vy = Math.sin(a) * 120;
+  sfx.thud();
+  burst(w.x, w.y, '#9b6bd6', 8, 50, 0.5);
+}
+// Saved wisps spiral into the shrine; lost wisps drift off and dim.
+function stepFading(w, dt) {
+  w.t += dt;
+  if (w.st === 'saved') {
+    const tx = gate.ex + gate.nx * 30, ty = gate.ey + gate.ny * 30;
+    const ang = w.a0 + w.t * 9, rad = Math.max(0, 16 * (1 - w.t / 0.9));
+    w.x += (tx + Math.cos(ang) * rad - w.x) * Math.min(1, dt * 12);
+    w.y += (ty + Math.sin(ang) * rad - w.y) * Math.min(1, dt * 12);
+    w.alpha = clamp(1 - w.t / 0.9, 0, 1);
+  } else {
+    const k = Math.exp(-3 * dt);
+    w.vx *= k; w.vy *= k;
+    w.x += w.vx * dt; w.y += w.vy * dt;
+    w.alpha = clamp(0.5 * (1 - w.t / 1.2), 0, 1);
+  }
+}
+// Pushes a circle out of every obstacle; removes the velocity component into it.
+function pushOut(p, r) {
+  for (const o of obstacles) {
+    const dx = p.x - o.x, dy = p.y - o.y, d = Math.hypot(dx, dy), min = o.r + r;
+    if (d >= min) continue;
+    const nx = d > 1e-6 ? dx / d : 1, ny = d > 1e-6 ? dy / d : 0;
+    p.x = o.x + nx * min; p.y = o.y + ny * min;
+    const vn = (p.vx || 0) * nx + (p.vy || 0) * ny;
+    if (vn < 0) { p.vx -= vn * nx; p.vy -= vn * ny; }
+  }
+}
+function clampField(p, r) {
+  if (p.x < r) { p.x = r; if (p.vx < 0) p.vx = 0; }
+  if (p.x > W - r) { p.x = W - r; if (p.vx > 0) p.vx = 0; }
+  if (p.y < r) { p.y = r; if (p.vy < 0) p.vy = 0; }
+  if (p.y > H - r) { p.y = H - r; if (p.vy > 0) p.vy = 0; }
+}
+
+/* ---------- 6. MOTHS, KEEPER, WIND ---------- */
+function edgePoint() {
+  const e = Math.floor(Math.random() * 4), t = Math.random();
+  if (e === 0) return { x: MOTH_R, y: rand(MOTH_R, H - MOTH_R) };
+  if (e === 1) return { x: rand(MOTH_R, W - MOTH_R), y: MOTH_R };
+  if (e === 2) return { x: W - MOTH_R, y: rand(MOTH_R, H - MOTH_R) };
+  return { x: rand(MOTH_R, W - MOTH_R), y: H - MOTH_R };
+}
+function stepMoths(dt) {
+  for (let i = pendingMoths.length - 1; i >= 0; i--) {
+    pendingMoths[i] -= dt;
+    if (pendingMoths[i] <= 0) {
+      pendingMoths.splice(i, 1);
+      const p = edgePoint();
+      moths.push({ x: p.x, y: p.y, vx: 0, vy: 0, stun: 0, stunAge: 0, kx: 0, ky: 0, gone: false, tgt: null, feed: 0, phase: Math.random() * TAU });
+    }
+  }
+  const flock = wisps.filter(w => w.st === 'flock');
+  let cx = 0, cy = 0;
+  for (const w of flock) { cx += w.x; cy += w.y; }
+  if (flock.length) { cx /= flock.length; cy /= flock.length; }
+  for (const m of moths) {
+    if (m.stun > 0) {                         // stunned by a flare: knocked back, then idle
+      m.stun -= dt; m.stunAge += dt;
+      m.x += m.kx * dt; m.y += m.ky * dt;
+      const k = Math.exp(-3 * dt); m.kx *= k; m.ky *= k;
+      if (m.x < -20 || m.x > W + 20 || m.y < -20 || m.y > H + 20) {
+        m.gone = true;                        // flew off-screen: respawns 4 s after the stun
+        pendingMoths.push(Math.max(0.1, MOTH_RESPAWN - m.stunAge));
+      }
+      continue;
+    }
+    if (m.feed > 0) {                         // feeding on a caught wisp: stationary, pulsing
+      m.feed -= dt; m.vx = 0; m.vy = 0;
+      continue;
+    }
+    // Target: the wisp farthest from the flock centroid.
+    let tgt = null, far = -1;
+    for (const w of flock) {
+      const d = (w.x - cx) ** 2 + (w.y - cy) ** 2;
+      if (d > far) { far = d; tgt = w; }
+    }
+    m.tgt = tgt;
+    let dx = 0, dy = 0;
+    if (tgt) {
+      const ux = tgt.x - m.x, uy = tgt.y - m.y, d = Math.hypot(ux, uy) || 1;
+      dx += ux / d; dy += uy / d;
+    }
+    const kx = m.x - keeper.x, ky = m.y - keeper.y, kd = Math.hypot(kx, ky);
+    if (kd < REPEL_R && kd > 0.01) {          // flee the keeper's aura
+      const s = MOTH_REPEL * (1 - kd / REPEL_R) ** 2;
+      dx += (kx / kd) * s; dy += (ky / kd) * s;
+    }
+    const dl = Math.hypot(dx, dy) || 1;
+    const k = Math.min(1, dt * 4);
+    m.vx += ((dx / dl) * MOTH_V - m.vx) * k;
+    m.vy += ((dy / dl) * MOTH_V - m.vy) * k;
+    m.x = clamp(m.x + m.vx * dt, MOTH_R, W - MOTH_R);
+    m.y = clamp(m.y + m.vy * dt, MOTH_R, H - MOTH_R);
+    if (tgt && tgt.st === 'flock' && Math.hypot(tgt.x - m.x, tgt.y - m.y) < MOTH_KILL_R) {
+      loseWisp(tgt, m);
+      m.feed = MOTH_FEED; m.tgt = null; m.vx = 0; m.vy = 0;
+    }
+  }
+  moths = moths.filter(m => !m.gone);
+}
+function stepKeeper(dt) {
+  let ax = 0, ay = 0;
+  if (keys.left) ax -= 1;
+  if (keys.right) ax += 1;
+  if (keys.up) ay -= 1;
+  if (keys.down) ay += 1;
+  if (ax || ay) {
+    const m = Math.hypot(ax, ay);
+    keeper.x += (ax / m) * KEEPER_SPEED * dt;
+    keeper.y += (ay / m) * KEEPER_SPEED * dt;
+  } else if (ptrTarget) {                     // walk toward the held pointer, stop within 6 px
+    const dx = ptrTarget.x - keeper.x, dy = ptrTarget.y - keeper.y, d = Math.hypot(dx, dy);
+    if (d > KEEPER_REACH) {
+      const s = Math.min(KEEPER_SPEED * dt, d - KEEPER_REACH);
+      keeper.x += (dx / d) * s; keeper.y += (dy / d) * s;
+    }
+  }
+  keeper.fcd = Math.max(0, keeper.fcd - dt);
+  pushOut(keeper, KEEPER_R);
+  clampField(keeper, KEEPER_R);
+}
+function flare() {
+  if (state !== 'playing' || keeper.fcd > 0) return;
+  keeper.fcd = FLARE_CD;
+  sfx.whoosh();
+  shake.t = 0.2; shake.m = 4;
+  rings.push({ x: keeper.x, y: keeper.y, r: 0, life: 0.4, max: 0.4 });
+  burst(keeper.x, keeper.y, '#fff3d0', 14, 160, 0.4);
+  for (const w of wisps) {
+    if (w.st !== 'flock') continue;
+    const dx = w.x - keeper.x, dy = w.y - keeper.y, d = Math.hypot(dx, dy);
+    if (d < FLARE_R) {
+      const ux = d > 0.01 ? dx / d : 1, uy = d > 0.01 ? dy / d : 0;
+      w.vx += ux * FLARE_V; w.vy += uy * FLARE_V;
+    }
+  }
+  for (const m of moths) {
+    const dx = m.x - keeper.x, dy = m.y - keeper.y, d = Math.hypot(dx, dy);
+    if (d < FLARE_R && !m.gone) {
+      const ux = d > 0.01 ? dx / d : 1, uy = d > 0.01 ? dy / d : 0;
+      m.stun = m.feed > 0 ? MOTH_FEED_STUN : FLARE_STUN; m.stunAge = 0; m.feed = 0;
+      m.kx = ux * FLARE_V; m.ky = uy * FLARE_V;
+    }
+  }
+}
+function stepWind(dt) {
+  if (demo || night < WIND_START_NIGHT) return;
+  windTimer -= dt;
+  if (windTimer <= 1 && windNext === null) windNext = rand(0, TAU);   // warning arrow
+  if (windTimer <= 0) {
+    windDir = windNext !== null ? windNext : rand(0, TAU);
+    windNext = null; windLeft = WIND_DUR; windTimer += WIND_EVERY;
+  }
+  if (windLeft > 0) {
+    windLeft -= dt;
+    const dx = Math.cos(windDir) * WIND_V * dt, dy = Math.sin(windDir) * WIND_V * dt;
+    for (const w of wisps) if (w.st === 'flock') { w.x += dx; w.y += dy; }
+  }
+}
+
+/* ---------- 7. RULES & FLOW ---------- */
+function updatePlaying(dt) {
+  timeLeft -= dt;
+  stepKeeper(dt);
+  stepWind(dt);
+  stepWisps(dt);
+  stepMoths(dt);
+  let flockN = 0;
+  for (const w of wisps) if (w.st === 'flock') flockN++;
+  if (timeLeft <= 0 && flockN > 0) {          // timer out: stragglers count as lost
+    timeLeft = 0;
+    for (const w of wisps) if (w.st === 'flock') loseWisp(w, null);
+    flockN = 0;
+  }
+  if (flockN === 0 && endT < 0) endT = 1.0;   // let the last saves finish animating
+  if (endT >= 0) {
+    endT -= dt;
+    if (endT <= 0) endNight();
+  }
+}
+function updateDemo(dt) {
+  demoT += dt;
+  keeper.x = W / 2 + Math.cos(demoT * 0.5) * W * 0.3;
+  keeper.y = H / 2 + Math.sin(demoT * 0.8) * H * 0.25;
+  keeper.fcd = 0;
+  stepWisps(dt);
+}
+function endNight() {
+  const pass = saved >= needed;
+  const perfect = pass && lost === 0;
+  const tb = pass ? Math.max(0, Math.floor(timeLeft)) * TIME_BONUS : 0;
+  const pb = perfect ? PERFECT_BONUS : 0;
+  addScore(tb + pb);
+  summary = { night, N, needed, saved, lost, pass, tb, pb };
+  state = 'summary';
+  guard = GUARD_T;
+  if (pass) sfx.chord(); else sfx.fail();
+  saveBest();
+}
+function continueAfterSummary() {
+  if (summary.pass) {
+    setupNight(night + 1);
+    state = 'playing';
+  } else {
+    state = 'over';
+    guard = GUARD_T;
+    saveBest();
+  }
+}
+function startGame() {
+  ensureAudio();
+  demo = false;
+  score = 0;
+  setupNight(1);
+  state = 'playing';
+}
+// Space / Enter / tap: advances the title, summary and game-over screens.
+function advance() {
+  if (state === 'title') startGame();
+  else if (state === 'summary' && guard <= 0) continueAfterSummary();
+  else if (state === 'over' && guard <= 0) startGame();
+  syncGame();
+}
+function togglePause() {
+  if (state === 'playing') state = 'paused';
+  else if (state === 'paused') state = 'playing';
+}
+
+/* ---------- 8. INPUT ---------- */
+// Pause button: drawn as a 40-px square; the touch target is at least 44 CSS px at any scale.
+const PAUSE_VIS = 40, PAUSE_MARGIN = 8, PAUSE_MIN_CSS = 44;
+function pauseRect() {
+  const s = Math.max(PAUSE_VIS, PAUSE_MIN_CSS / SC);   // logical side of the hit box
+  return { x: W - PAUSE_MARGIN - s, y: PAUSE_MARGIN, w: s, h: s };
+}
+function inPauseBtn(p) {
+  const b = pauseRect();
+  return p.x >= b.x && p.x <= b.x + b.w && p.y >= b.y && p.y <= b.y + b.h;
+}
+function toLogical(e) {
+  return { x: (e.clientX - OX) / SC, y: (e.clientY - OY) / SC };
+}
+window.addEventListener('keydown', (e) => {
+  ensureAudio();
+  const k = CTRL[e.code];
+  if (k) { keys[k] = true; e.preventDefault(); return; }
+  if (e.code === 'Space') {
+    e.preventDefault();
+    if (e.repeat) return;
+    if (state === 'playing') flare(); else advance();
+  } else if (e.code === 'Enter') {
+    if (!e.repeat) advance();
+  } else if ((e.code === 'KeyP' || e.code === 'Escape') && !e.repeat) {
+    togglePause();
+  }
+  syncGame();
+});
+window.addEventListener('keyup', (e) => {
+  const k = CTRL[e.code];
+  if (k) keys[k] = false;
+});
+window.addEventListener('blur', () => {
+  keys = {};
+  if (state === 'playing') state = 'paused';
+});
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) return;
+  keys = {};
+  if (state === 'playing') state = 'paused';
+});
+let lastDown = null;
+cv.addEventListener('pointerdown', (e) => {
+  ensureAudio();
+  if (e.button === 2) return;                 // right-click flares via contextmenu
+  const p = toLogical(e);
+  if (state === 'title' || state === 'summary' || state === 'over') { advance(); return; }
+  if (state === 'paused') { state = 'playing'; syncGame(); return; }
+  if (state !== 'playing') return;
+  if (inPauseBtn(p)) { state = 'paused'; syncGame(); return; }
+  const now = performance.now();
+  if (now - lastTapT < 320 && Math.hypot(e.clientX - lastTapX, e.clientY - lastTapY) < 40) {
+    flare();                                  // double-tap flares
+    lastTapT = 0;
+  } else {
+    lastTapT = now; lastTapX = e.clientX; lastTapY = e.clientY;
+  }
+  ptrId = e.pointerId;
+  ptrTarget = p;
+  lastDown = p;
+  syncGame();
+});
+window.addEventListener('pointermove', (e) => {
+  if (e.pointerId === ptrId && state === 'playing') ptrTarget = toLogical(e);
+});
+function pointerRelease(e) {
+  if (e.pointerId === ptrId) { ptrId = null; ptrTarget = null; }
+}
+window.addEventListener('pointerup', pointerRelease);
+window.addEventListener('pointercancel', pointerRelease);
+window.addEventListener('contextmenu', (e) => {
+  e.preventDefault();
+  if (state === 'playing') flare();
+});
+window.addEventListener('resize', () => {
+  const oldW = W, oldH = H;
+  if (!layout()) return;
+  grass = null;
+  if (state === 'title') setupDemo();
+  else remapField(oldW, oldH);
+  syncGame();
+});
+
+/* ---------- 9. RENDERING ---------- */
+function makeSprite(size, stops) {
+  const c = document.createElement('canvas');
+  c.width = c.height = size;
+  const g = c.getContext('2d');
+  const grd = g.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+  for (const [o, col] of stops) grd.addColorStop(o, col);
+  g.fillStyle = grd;
+  g.fillRect(0, 0, size, size);
+  return c;
+}
+const SPR = {
+  wisp: makeSprite(64, [[0, 'rgba(191,248,255,1)'], [0.25, 'rgba(191,248,255,0.45)'], [1, 'rgba(191,248,255,0)']]),
+  lamp: makeSprite(256, [[0, 'rgba(255,207,107,0.9)'], [0.35, 'rgba(255,207,107,0.3)'], [1, 'rgba(255,207,107,0)']]),
+  hole: makeSprite(256, [[0, 'rgba(0,0,0,1)'], [0.5, 'rgba(0,0,0,0.85)'], [1, 'rgba(0,0,0,0)']]),
+  shrine: makeSprite(128, [[0, 'rgba(143,255,193,0.5)'], [1, 'rgba(143,255,193,0)']]),
+  moth: makeSprite(64, [[0, 'rgba(170,90,220,0.45)'], [1, 'rgba(170,90,220,0)']]),
+};
+function makeGrass() {
+  const out = [];
+  for (let i = 0; i < 160; i++) out.push({ x: Math.random() * W, y: Math.random() * H, h: 6 + Math.random() * 10, l: (Math.random() - 0.5) * 6 });
+  out.W = W; out.H = H;
+  return out;
+}
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+function text(str, x, y, size, color, align = 'center', weight = '600') {
+  ctx.font = `${weight} ${size}px ${FONT}`;
+  ctx.fillStyle = color;
+  ctx.textAlign = align;
+  ctx.textBaseline = 'middle';
+  ctx.fillText(str, x, y);
+}
+function dim(a) {
+  ctx.fillStyle = `rgba(2,4,10,${a})`;
+  ctx.fillRect(0, 0, W, H);
+}
+function panel(x, y, w, h) {
+  roundRect(x, y, w, h, 14);
+  ctx.fillStyle = 'rgba(6,12,24,0.88)';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(191,248,255,0.3)';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+}
+function burst(x, y, color, n, speed, life) {
+  for (let i = 0; i < n && particles.length < 300; i++) {
+    const a = Math.random() * TAU, s = Math.random() * speed;
+    particles.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life, max: life, color, size: 1 + Math.random() * 2 });
+  }
+}
+function drawField() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#0a1420');
+  g.addColorStop(1, '#13243a');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  if (!grass || grass.W !== W || grass.H !== H) grass = makeGrass();
+  ctx.strokeStyle = 'rgba(70,130,110,0.35)';
+  ctx.lineWidth = 1.2;
+  ctx.beginPath();
+  for (const t of grass) {
+    ctx.moveTo(t.x - 2, t.y); ctx.quadraticCurveTo(t.x + t.l * 0.5, t.y - t.h * 0.6, t.x + t.l, t.y - t.h);
+    ctx.moveTo(t.x, t.y); ctx.lineTo(t.x + t.l * 0.2, t.y - t.h * 0.8);
+  }
+  ctx.stroke();
+  ctx.strokeStyle = 'rgba(120,170,220,0.12)';
+  ctx.lineWidth = 3;
+  ctx.strokeRect(0, 0, W, H);
+  for (const o of obstacles) {
+    const sg = ctx.createRadialGradient(o.x - o.r * 0.3, o.y - o.r * 0.3, o.r * 0.2, o.x, o.y, o.r);
+    sg.addColorStop(0, '#4a5568');
+    sg.addColorStop(1, '#232b3a');
+    ctx.fillStyle = sg;
+    ctx.beginPath(); ctx.arc(o.x, o.y, o.r, 0, TAU); ctx.fill();
+    ctx.strokeStyle = '#5b6780'; ctx.lineWidth = 2; ctx.stroke();
+  }
+}
+// Darkness over the field with the lantern and wisps cut out as light holes.
+function drawDarkness(sx, sy) {
+  lctx.setTransform(1, 0, 0, 1, 0, 0);
+  lctx.globalCompositeOperation = 'source-over';
+  lctx.clearRect(0, 0, lightCv.width, lightCv.height);
+  lctx.fillStyle = 'rgba(3,7,16,0.55)';
+  lctx.fillRect(0, 0, lightCv.width, lightCv.height);
+  setView(lctx, sx, sy);
+  lctx.globalCompositeOperation = 'destination-out';
+  lctx.drawImage(SPR.hole, keeper.x - 130, keeper.y - 130, 260, 260);
+  for (const w of wisps) {
+    if (w.st === 'lost') continue;
+    const r = w.st === 'saved' ? 26 * Math.max(0.2, w.alpha) : 26;
+    lctx.drawImage(SPR.hole, w.x - r, w.y - r, 2 * r, 2 * r);
+  }
+  lctx.globalCompositeOperation = 'source-over';
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.drawImage(lightCv, 0, 0);
+  setView(ctx, sx, sy);
+}
+function drawShrine(t) {
+  ctx.save();
+  // Local frame: u along the wall (tangent), v inward (normal), origin at the gate centre.
+  ctx.transform(gate.tx, gate.ty, gate.nx, gate.ny, gate.ex, gate.ey);
+  const pulse = 0.75 + 0.25 * Math.sin(t * 3);
+  const grd = ctx.createLinearGradient(0, 0, 0, GATE_DEPTH);
+  grd.addColorStop(0, `rgba(143,255,193,${0.38 * pulse})`);
+  grd.addColorStop(1, 'rgba(143,255,193,0)');
+  ctx.fillStyle = grd;
+  ctx.fillRect(-GATE_LEN / 2, 0, GATE_LEN, GATE_DEPTH);
+  ctx.fillStyle = `rgba(143,255,193,${0.9 * pulse})`;
+  ctx.fillRect(-GATE_LEN / 2 - 3, -2, 5, 14);
+  ctx.fillRect(GATE_LEN / 2 - 2, -2, 5, 14);
+  ctx.globalAlpha = pulse;
+  ctx.drawImage(SPR.shrine, -40, 30 - 40, 80, 80);
+  ctx.globalAlpha = 1;
+  ctx.restore();
+}
+function drawWisps(t) {
+  for (const w of wisps) {
+    if (w.st === 'flock' && w.trail.length > 1) {
+      ctx.strokeStyle = 'rgba(191,248,255,0.18)';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(w.trail[0].x, w.trail[0].y);
+      for (let i = 1; i < w.trail.length; i++) ctx.lineTo(w.trail[i].x, w.trail[i].y);
+      ctx.stroke();
+    }
+    const flock = w.st === 'flock';
+    const a = flock ? 1 : w.alpha;
+    if (a <= 0) continue;
+    const r = 14 * (1 + 0.12 * Math.sin(t * 9 + w.phase));
+    ctx.globalAlpha = a * (w.st === 'lost' ? 0.5 : 1);
+    ctx.drawImage(SPR.wisp, w.x - r, w.y - r, 2 * r, 2 * r);
+    ctx.fillStyle = w.st === 'lost' ? '#6c7a8a' : '#e6feff';
+    ctx.beginPath(); ctx.arc(w.x, w.y, WISP_R, 0, TAU); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function drawMoths(t) {
+  for (const m of moths) {
+    const stunned = m.stun > 0;
+    const flap = Math.sin(t * (stunned ? 6 : 22) + m.phase);
+    const spread = 0.5 + 0.5 * flap;
+    ctx.save();
+    ctx.translate(m.x, m.y);
+    ctx.rotate(Math.atan2(m.vy, m.vx));
+    const pulse = m.feed > 0 ? 1 + 0.12 * Math.sin(t * 10) : 1;
+    ctx.scale(pulse, pulse);
+    ctx.globalAlpha = stunned && Math.sin(t * 16) > 0 ? 0.4 : 1;
+    ctx.drawImage(SPR.moth, -22, -22, 44, 44);
+    ctx.fillStyle = '#3a1d4a';
+    ctx.strokeStyle = 'rgba(190,130,240,0.45)';
+    ctx.lineWidth = 1;
+    for (const s of [-1, 1]) {
+      ctx.beginPath();
+      ctx.ellipse(-1, s * (3 + 4 * spread), 7, 3.5, s * (0.3 + 0.5 * spread), 0, TAU);
+      ctx.fill(); ctx.stroke();
+    }
+    ctx.beginPath();
+    ctx.ellipse(0, 0, 8, 3.5, 0, 0, TAU);
+    ctx.fill(); ctx.stroke();
+    ctx.restore();
+  }
+}
+function drawKeeper(t) {
+  const k = keeper;
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.globalAlpha = 0.9;
+  ctx.drawImage(SPR.lamp, k.x - 120, k.y - 120, 240, 240);
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = '#8a5a2b';
+  ctx.beginPath(); ctx.arc(k.x, k.y, 13, 0, TAU); ctx.fill();
+  ctx.fillStyle = '#ffcf6b';
+  ctx.beginPath(); ctx.arc(k.x, k.y, 9, 0, TAU); ctx.fill();
+  ctx.fillStyle = `rgba(255,246,216,${0.8 + 0.2 * Math.sin(t * 13)})`;
+  ctx.beginPath(); ctx.arc(k.x, k.y, 4, 0, TAU); ctx.fill();
+  // Flare cooldown ring: fills clockwise while recharging.
+  const prog = 1 - k.fcd / FLARE_CD;
+  ctx.lineWidth = 2.5;
+  ctx.strokeStyle = 'rgba(255,207,107,0.25)';
+  ctx.beginPath(); ctx.arc(k.x, k.y, 22, 0, TAU); ctx.stroke();
+  ctx.strokeStyle = k.fcd > 0 ? 'rgba(255,207,107,0.9)' : 'rgba(255,250,230,1)';
+  ctx.beginPath(); ctx.arc(k.x, k.y, 22, -Math.PI / 2, -Math.PI / 2 + TAU * prog); ctx.stroke();
+}
+function drawFx() {
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.lineWidth = 3;
+  for (const r of rings) {
+    ctx.strokeStyle = `rgba(255,255,255,${0.7 * r.life / r.max})`;
+    ctx.beginPath(); ctx.arc(r.x, r.y, r.r, 0, TAU); ctx.stroke();
+  }
+  for (const p of particles) {
+    ctx.globalAlpha = clamp(p.life / p.max, 0, 1);
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, TAU); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+  for (const f of floaters) {
+    text(f.text, f.x, f.y, 15, f.color);
+  }
+}
+function drawWindArrow(t) {
+  const warn = windNext !== null && windLeft <= 0;
+  if (!warn && windLeft <= 0) return;
+  const dir = windLeft > 0 ? windDir : windNext;
+  const a = warn ? 0.45 + 0.25 * Math.sin(t * 10) : 0.9;
+  const cx = W / 2, cy = H / 2;
+  const ex = cx + Math.cos(dir) * 80, ey = cy + Math.sin(dir) * 80;
+  ctx.save();
+  ctx.strokeStyle = `rgba(191,248,255,${a})`;
+  ctx.fillStyle = `rgba(191,248,255,${a})`;
+  ctx.lineWidth = 4;
+  ctx.beginPath(); ctx.moveTo(cx - Math.cos(dir) * 30, cy - Math.sin(dir) * 30); ctx.lineTo(ex, ey); ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(ex, ey);
+  ctx.lineTo(ex - Math.cos(dir - 0.5) * 16, ey - Math.sin(dir - 0.5) * 16);
+  ctx.lineTo(ex - Math.cos(dir + 0.5) * 16, ey - Math.sin(dir + 0.5) * 16);
+  ctx.closePath(); ctx.fill();
+  text('WIND', cx, cy - 46, 14, `rgba(191,248,255,${a})`);
+  ctx.restore();
+}
+function drawHUD() {
+  const hud = (size) => Math.max(size, 13 / SC);   // HUD text is at least 13 CSS px on screen
+  const pb = pauseRect();
+  text(`NIGHT ${night}`, 14, 20, hud(16), '#e6feff', 'left');
+  text(`${Math.ceil(Math.max(0, timeLeft))}s`, 14, 46, hud(14), '#9fb4c8', 'left');
+  text(`${saved} / ${needed} needed of ${N}`, W / 2, 20, hud(16), saved >= needed ? '#8fffc1' : '#e6feff');
+  text(`${score}`, pb.x - 10, 20, hud(16), '#ffd98a', 'right');
+  // Button: visual square centred in the (possibly larger) hit box.
+  const vx = pb.x + (pb.w - PAUSE_VIS) / 2, vy = pb.y + (pb.h - PAUSE_VIS) / 2;
+  roundRect(vx, vy, PAUSE_VIS, PAUSE_VIS, 8);
+  ctx.fillStyle = 'rgba(255,255,255,0.1)'; ctx.fill();
+  ctx.strokeStyle = 'rgba(191,248,255,0.3)'; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.fillStyle = '#e6feff';
+  const cx = vx + PAUSE_VIS / 2, cy = vy + PAUSE_VIS / 2;
+  ctx.fillRect(cx - 9, cy - 10, 6, 20);
+  ctx.fillRect(cx + 3, cy - 10, 6, 20);
+  if (banner > 0) text(`Night ${night}`, W / 2, H * 0.4, 36, `rgba(230,254,255,${Math.min(1, banner)})`);
+}
+function drawTitle(t) {
+  dim(0.3);
+  ctx.shadowColor = 'rgba(191,248,255,0.8)';
+  ctx.shadowBlur = 24;
+  text('WISP HERDER', W / 2, H * 0.2, Math.min(56, W * 0.075), '#bff8ff', 'center', '800');
+  ctx.shadowBlur = 0;
+  text('Push the flock into the shrine before the', W / 2, H * 0.31, 17, '#c8d6e6');
+  text('shadow-moths pick off the stragglers.', W / 2, H * 0.31 + 24, 17, '#c8d6e6');
+  const pw = Math.min(W * 0.84, 500), px = (W - pw) / 2, py = H * 0.42;
+  panel(px, py, pw, 118);
+  text('Move    WASD / Arrows  |  touch: walk to your finger', W / 2, py + 26, 15, '#e6feff');
+  text('Flare   Space  |  double-tap or right-click  (3 s)', W / 2, py + 58, 15, '#e6feff');
+  text('Pause   P / Esc  |  pause button', W / 2, py + 90, 15, '#e6feff');
+  text('Press Enter, Space or tap to start', W / 2, H * 0.7, 18, `rgba(255,217,138,${0.6 + 0.4 * Math.sin(t * 3)})`);
+  text(`Best ${best}`, W / 2, H * 0.8, 16, '#9fb4c8');
+}
+function drawSummaryCard() {
+  const s = summary;
+  dim(0.45);
+  const pw = Math.min(W * 0.84, 460), ph = 262, px = (W - pw) / 2, py = (H - ph) / 2;
+  panel(px, py, pw, ph);
+  text(s.pass ? `Night ${s.night} cleared` : `Night ${s.night} failed`, W / 2, py + 34, 24, s.pass ? '#8fffc1' : '#ff8fa3', 'center', '800');
+  text(`Saved   ${s.saved} / ${s.needed} needed (of ${s.N})`, W / 2, py + 84, 17, '#e6feff');
+  text(`Lost    ${s.lost}`, W / 2, py + 112, 17, '#e6feff');
+  let row = 140;
+  if (s.pass) { text(`Time bonus   +${s.tb}`, W / 2, py + row, 17, '#c8d6e6'); row += 26; }
+  if (s.pb) { text(`Perfect   +${s.pb}`, W / 2, py + row, 17, '#ffd98a'); row += 26; }
+  text(`Score   ${score}`, W / 2, py + row + 6, 19, '#ffd98a', 'center', '800');
+  const ready = guard <= 0;
+  text(s.pass ? 'Tap or Space: next night' : 'Tap or Space: see results', W / 2, py + ph - 26, 15,
+    ready ? '#e6feff' : 'rgba(230,254,255,0.35)');
+}
+function drawOverCard() {
+  dim(0.6);
+  const pw = Math.min(W * 0.84, 420), ph = 230, px = (W - pw) / 2, py = (H - ph) / 2;
+  panel(px, py, pw, ph);
+  text('GAME OVER', W / 2, py + 40, 28, '#ff8fa3', 'center', '800');
+  text(`Reached night ${night}`, W / 2, py + 84, 18, '#e6feff');
+  text(`Score ${score}`, W / 2, py + 114, 18, '#ffd98a');
+  text(`Best ${best}`, W / 2, py + 142, 16, '#9fb4c8');
+  text('Tap or Space to restart', W / 2, py + ph - 28, 15, guard <= 0 ? '#e6feff' : 'rgba(230,254,255,0.35)');
+}
+function drawPauseCard() {
+  dim(0.5);
+  text('PAUSED', W / 2, H / 2 - 14, 32, '#e6feff', 'center', '800');
+  text('P / Esc or tap to resume', W / 2, H / 2 + 22, 16, '#9fb4c8');
+}
+function render(now) {
+  const t = now / 1000;
+  const sx = shake.t > 0 ? rand(-shake.m, shake.m) : 0;
+  const sy = shake.t > 0 ? rand(-shake.m, shake.m) : 0;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = '#03060c';
+  ctx.fillRect(0, 0, cv.width, cv.height);
+  setView(ctx, sx, sy);
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0, 0, W, H); ctx.clip();
+  drawField();
+  drawDarkness(sx, sy);
+  drawMoths(t);
+  ctx.globalCompositeOperation = 'lighter';
+  drawShrine(t);
+  drawWisps(t);
+  ctx.globalCompositeOperation = 'source-over';
+  drawKeeper(t);
+  drawFx();
+  drawWindArrow(t);
+  if (state !== 'title') drawHUD();
+  ctx.restore();
+  // Overlays are not shaken.
+  setView(ctx, 0, 0);
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0, 0, W, H); ctx.clip();
+  if (state === 'title') drawTitle(t);
+  else if (state === 'paused') drawPauseCard();
+  else if (state === 'summary' && summary) drawSummaryCard();
+  else if (state === 'over') drawOverCard();
+  ctx.restore();
+}
+
+/* ---------- 10. MAIN LOOP (fixed timestep, dt clamped to 50 ms) ---------- */
+function updateRealtime(dt) {
+  guard = Math.max(0, guard - dt);
+  banner = Math.max(0, banner - dt);
+  shake.t = Math.max(0, shake.t - dt);
+  for (const p of particles) {
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.vx *= Math.exp(-2 * dt); p.vy *= Math.exp(-2 * dt);
+    p.life -= dt;
+  }
+  particles = particles.filter(p => p.life > 0);
+  for (const r of rings) {
+    r.life -= dt;
+    r.r = FLARE_R * (1 - Math.max(0, r.life) / r.max);
+  }
+  rings = rings.filter(r => r.life > 0);
+  for (const f of floaters) { f.y -= 30 * dt; f.life -= dt; }
+  floaters = floaters.filter(f => f.life > 0);
+}
+let lastT = performance.now(), acc = 0;
+function frame(now) {
+  const t0 = performance.now();
+  const dt = clamp((now - lastT) / 1000, 0, 0.05);
+  lastT = now;
+  elapsed += dt;
+  if (state === 'title' || state === 'playing') {
+    acc += dt;
+    while (acc >= STEP && (state === 'title' || state === 'playing')) {
+      if (state === 'title') updateDemo(STEP); else updatePlaying(STEP);
+      acc -= STEP;
+    }
+  } else {
+    acc = 0;
+  }
+  updateRealtime(dt);
+  render(now);
+  syncGame();
+  frameMs = frameMs * 0.9 + (performance.now() - t0) * 0.1;
+  requestAnimationFrame(frame);
+}
+
+layout();
+setupDemo();
+syncGame();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
