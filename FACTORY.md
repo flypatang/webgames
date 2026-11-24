@@ -21,7 +21,7 @@ The orchestrator never writes game code. The reviewer never edits files.
 - One self-contained `index.html`: vanilla JS + `<canvas>`, inline CSS/JS, **no external requests** (no CDNs, fonts, images). Art is procedural or drawn shapes; sound uses WebAudio synthesis (muted until the first user input).
 - States: title screen → playing → game over → restart, with no page reload needed.
 - Controls: keyboard **and** pointer/touch. Show the controls on the title screen.
-- Canvas scales to the window (letterboxed and DPR-aware), and the game stays playable at 375px wide.
+- Canvas scales to the window (letterboxed and DPR-aware: the CSS size = the viewport fit, the backing store = CSS × devicePixelRatio), and the game stays playable at 375px wide on a DPR-3 phone. The smoke test checks this.
 - A fixed-timestep update (or a dt clamped to ≤ 50ms) so a tab switch doesn't break the physics.
 - Persist a high score in `localStorage` (inside try/catch).
 - Pause on `P`/`Esc` and on `visibilitychange`.
