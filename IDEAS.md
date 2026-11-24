@@ -10,7 +10,7 @@ Check this before pitching so concepts and genres stay varied.
 | 5 | candle-crypt | Candle Crypt | turn-based roguelike | wax = HP + clock, light radius | shipped |
 | 6 | hedgewise | Hedgewise | maze-building tower defense | hedges reroute the path, gnomes sit on hedges | building |
 | 7 | drift-lines | Drift Lines | top-down racing | seeded tracks, drift fills boost, ghost | building |
-| 8 | soot-sprite | Soot Sprite | vertical platformer | wall-jump climber vs rising embers | building |
+| 8 | soot-sprite | Soot Sprite | vertical platformer | wall-jump climber vs rising embers | shipped |
 
 ## Backlog (minor follow-ups)
 - orbit-courier: a respawn-caused retarget shouldn't reset the combo; the THRUST_A comment (line 34) is stale.

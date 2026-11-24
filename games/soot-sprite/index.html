@@ -1,0 +1,1082 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,maximum-scale=1,user-scalable=no">
+<meta name="description" content="Soot Sprite: wall-jump up an endless chimney while the ember tide rises.">
+<title>Soot Sprite</title>
+<style>
+html,body{margin:0;height:100%;background:#120c0b;overflow:hidden;touch-action:none;-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent}
+canvas{position:fixed;left:0;top:0;display:block}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+/* Soot Sprite: an endless wall-jumping climber. One self-contained file, no external requests.
+   Sections: 1) PURE logic (seeded segment generation, fixed-step physics, ember tide), no DOM
+             2) audio and input  3) rendering  4) game loop, state machine and overlays.
+   Section 1 sits between the PURE markers so tests can load it in Node without a browser. */
+
+/*PURE-BEGIN*/
+// ---- 1a. constants ----
+const SW = 360;                  // logical shaft width (px)
+const SEG_H = 240;               // nominal segment height (px)
+const DT = 1 / 120;              // fixed physics step (s)
+const GRAV = 1500, MAX_FALL = 700, WALL_SLIDE = 140;
+const RUN = 190, ACCEL = 2200, AIR_CTRL = 0.75;
+const JUMP_V = 520, JUMP_CUT = 0.45;
+const WALL_PUSH = 260, WALL_UP = 500, WALL_LOCK = 0.12;
+const COYOTE = 0.08, JBUF = 0.1, DJ_V = 460, MAX_CHARGES = 2;
+const PW = 14, PH = 18, SPARK_R = 7;
+const VENT_ON = 1.2, VENT_OFF = 1.5, VENT_CYCLE = VENT_ON + VENT_OFF, VENT_WARN = 0.4;
+const VENT_H = 12, VENT_HALF = 12;
+const CRUMBLE_T = 0.5, CRUMBLE_RESPAWN = 4;
+// Reachability limits derived from the physics: single jump apex = 520^2/(2*1500) = 90.1 px,
+// a spark adds a double jump (460^2/(2*1500) = 70.5 px above the pickup height).
+const LIM = { dyRun: 85, gapRun: 100, dySpark: 120, gapSpark: 170, dyWall: 65, gapWall: 130, dyDown: -60 };
+
+// ---- 1b. seeded PRNG (mulberry32) ----
+function makeRng(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// ---- 1c. reachability ----
+// A foothold is {x0, x1, y, kind, sp?}: a horizontal interval whose top surface sits at height y.
+// kind: 'ledge' | 'crumble' (optional decoy) | 'wall' (a pinch-wall face used for wall-hops).
+// sp = a spark is placed on the route into this foothold, so the higher edge is allowed.
+function centerOf(f) { return (f.x0 + f.x1) / 2; }
+function gapOf(a, b) { return Math.max(0, b.x0 - a.x1, a.x0 - b.x1); }
+function edgeOK(a, b, hasSpark) {
+  const dy = b.y - a.y;
+  if (dy < LIM.dyDown) return false;
+  const gap = gapOf(a, b);
+  if (a.kind === 'wall' || b.kind === 'wall') return dy <= LIM.dyWall && gap <= LIM.gapWall;
+  if (dy <= LIM.dyRun && gap <= LIM.gapRun) return true;
+  return hasSpark && dy <= LIM.dySpark && gap <= LIM.gapSpark;
+}
+function chainOK(prev, chain) {
+  let a = prev;
+  for (const b of chain) {
+    if (!edgeOK(a, b, !!b.sp)) return false;
+    a = b;
+  }
+  return true;
+}
+// Appends cand to chain if the edge from prev is reachable, marking a spark when one is needed.
+function tryAdd(prev, cand, chain) {
+  if (edgeOK(prev, cand, false)) { chain.push(cand); return true; }
+  if (edgeOK(prev, cand, true)) { cand.sp = true; chain.push(cand); return true; }
+  return false;
+}
+
+// ---- 1d. segment templates ----
+// Each returns {chain, blocks, decoys} or null. chain is the required route (solvable by
+// construction and re-checked); decoys are optional crumble stepping stones off the route.
+function tplZig(rng, prev, goalY, opt) {
+  const chain = [], decoys = [];
+  let cur = prev;
+  for (let guard = 0; cur.y < goalY && guard < 40; guard++) {
+    let placed = false;
+    for (let t = 0; t < 16 && !placed; t++) {
+      const w = 60 + Math.floor(rng() * 41);
+      const dy = 45 + rng() * 35;
+      const cc = centerOf(cur);
+      const dir = cc < SW / 2 ? (rng() < 0.8 ? 1 : -1) : (rng() < 0.8 ? -1 : 1);
+      const c = cc + dir * (40 + rng() * 110);
+      const x0 = Math.min(SW - 6 - w, Math.max(6, Math.round(c - w / 2)));
+      const cand = { x0, x1: x0 + w, y: cur.y + dy, kind: 'ledge', gone: false, state: 'solid', t: 0 };
+      if (opt && opt.vent && rng() < 0.6) cand.ventPh = rng() * VENT_CYCLE;
+      if (tryAdd(cur, cand, chain)) {
+        placed = true;
+        if (opt && opt.decoy && rng() < 0.7) {
+          const far = cc < SW / 2 ? SW - 6 - w : 6;
+          decoys.push({ x0: far, x1: far + w, y: cur.y + dy * 0.5 + 6, kind: 'crumble', gone: false, state: 'solid', t: 0 });
+        }
+        cur = cand;
+      }
+    }
+    if (!placed) break;
+  }
+  return { chain, blocks: [], decoys };
+}
+
+// Narrow flue: pinch walls leave a 90-120 px gap; the route is a chain of wall-hops (alternating faces).
+function tplFlue(rng, prev, goalY) {
+  const gw = 90 + Math.floor(rng() * 31);
+  const a = 30 + Math.floor(rng() * 90);
+  const b = a + gw;
+  if (b > SW - 30) return null;
+  const top = Math.max(goalY, prev.y + 200);
+  const chain = [];
+  let cur = prev;
+  let side = centerOf(prev) < SW / 2 ? -1 : 1;
+  for (let guard = 0; cur.y < top && guard < 20; guard++) {
+    const dy = 45 + rng() * 15;
+    const x = side < 0 ? a : b;
+    const cand = { x0: x, x1: x, y: cur.y + dy, kind: 'wall' };
+    if (!tryAdd(cur, cand, chain)) return null;
+    cur = cand;
+    side = -side;
+  }
+  const y0 = prev.y - 10, y1 = cur.y + 4;
+  const blocks = [
+    { x0: 0, x1: a, y0, y1, side: -1, y: y1, kind: 'block' },
+    { x0: b, x1: SW, y0, y1, side: 1, y: y1, kind: 'block' },
+  ];
+  return { chain, blocks, decoys: [] };
+}
+
+// Open drop: a 150 px horizontal gap with no walls, so a spark mid-span is required.
+function tplDrop(rng, prev, goalY, opt) {
+  const w = 60 + Math.floor(rng() * 41);
+  const cc = centerOf(prev);
+  const dirs = cc < SW / 2 ? [1, -1] : [-1, 1];
+  for (const d of dirs) {
+    const x0 = d > 0 ? prev.x1 + 150 : prev.x0 - 150 - w;
+    if (x0 < 6 || x0 + w > SW - 6) continue;
+    const midX = d > 0 ? (prev.x1 + x0) / 2 : (x0 + w + prev.x0) / 2;
+    const cand = {
+      x0, x1: x0 + w, y: prev.y + (-20 + rng() * 35), kind: 'ledge', sp: true,
+      spX: midX, spY: prev.y + 70, gone: false, state: 'solid', t: 0,
+    };
+    if (!edgeOK(prev, cand, true)) continue;
+    const rest = tplZig(rng, cand, goalY, opt);
+    return { chain: [cand].concat(rest.chain), blocks: [], decoys: rest.decoys };
+  }
+  return null;
+}
+
+// Commits a validated template result into the world (footholds, blocks, sparks).
+function commitSegment(world, name, res) {
+  const k = world.nextK++;
+  const y0 = world.last.y;
+  let prev = world.last;
+  for (const f of res.chain) {
+    if (f.sp) {
+      if (f.spX !== undefined) world.sparks.push({ x: f.spX, y: f.spY, got: false });
+      else world.sparks.push({ x: (centerOf(prev) + centerOf(f)) / 2, y: (prev.y + f.y) / 2 + 22, got: false });
+    } else if (f.kind === 'ledge' && world.rng() < 0.3) {
+      world.sparks.push({ x: f.x0 + 10 + world.rng() * (f.x1 - f.x0 - 20), y: f.y + 22, got: false });
+    }
+    prev = f;
+  }
+  for (const f of res.chain) if (f.kind !== 'wall') world.ledges.push(f);
+  for (const d of res.decoys) world.ledges.push(d);
+  for (const b of res.blocks) world.blocks.push(b);
+  world.chain.push(...res.chain);
+  const last = res.chain[res.chain.length - 1];
+  world.chunks.push({ k, name, y0, y1: last.y, footholds: res.chain.length });
+  world.last = last;
+}
+
+// Picks a template by height (1-2 only below 1000 px; crumble and vents from 1000 px; drop from 2000 px).
+function genSegment(world) {
+  const h = world.last.y;
+  const k = world.nextK;
+  const names = h < 1000 ? ['zig', 'flue'] : h < 2000 ? ['zig', 'flue', 'crumble', 'vent'] : ['zig', 'flue', 'crumble', 'vent', 'drop'];
+  const goal = h + SEG_H;
+  for (let attempt = 0; attempt < 40; attempt++) {
+    const name = k === 0 ? 'zig' : names[Math.floor(world.rng() * names.length)];
+    const opt = { decoy: name === 'crumble', vent: name === 'vent' };
+    let res = null;
+    if (name === 'flue') res = tplFlue(world.rng, world.last, goal);
+    else if (name === 'drop') res = tplDrop(world.rng, world.last, goal, opt);
+    else res = tplZig(world.rng, world.last, goal, opt);
+    if (!res || res.chain.length === 0 || !chainOK(world.last, res.chain)) continue;
+    commitSegment(world, name, res);
+    return name;
+  }
+  // Fallback: plain zig-zag, which always passes the check.
+  const res = tplZig(world.rng, world.last, goal, {});
+  commitSegment(world, 'zig', res);
+  return 'zig';
+}
+
+function createWorld(seed) {
+  const start = { x0: 110, x1: 250, y: 0, kind: 'ledge', gone: false, state: 'solid', t: 0 };
+  return { seed, rng: makeRng(seed), ledges: [start], blocks: [], sparks: [], chunks: [], chain: [start], last: start, nextK: 0 };
+}
+function ensureWorld(world, height) {
+  let guard = 0;
+  while (world.last.y < height && guard++ < 400) genSegment(world);
+}
+
+// ---- 1e. player physics (fixed 120 Hz step) ----
+function makePlayer(x, y) {
+  return { x, y, vx: 0, vy: 0, ground: false, wall: 0, coyote: 0, jbuf: 0, lock: 0, charges: 0, cut: true, sparks: 0, maxY: y };
+}
+
+// The first ledge/block top the sprite crosses while falling (one-way: passing up through is free).
+function landOn(p, prevY, world) {
+  const half = PW / 2;
+  for (const l of world.ledges) {
+    if (l.gone || p.x + half <= l.x0 || p.x - half >= l.x1) continue;
+    if (prevY >= l.y - 1e-6 && p.y <= l.y) return l;
+  }
+  for (const b of world.blocks) {
+    if (p.x + half <= b.x0 || p.x - half >= b.x1) continue;
+    if (prevY >= b.y - 1e-6 && p.y <= b.y) return b;
+  }
+  return null;
+}
+
+// Advances the sprite one fixed step. inp = {left, right, held, jump} (jump = press edge this step).
+// Returns events: {type:'jump'|'walljump'|'dj'|'land', ledge?}.
+function stepPlayer(p, inp, world) {
+  const ev = [];
+  const dt = DT;
+  const half = PW / 2;
+  const wasGround = p.ground;
+  p.coyote = p.ground ? COYOTE : Math.max(0, p.coyote - dt);
+  p.jbuf = inp.jump ? JBUF : Math.max(0, p.jbuf - dt);
+  const dir = (inp.right ? 1 : 0) - (inp.left ? 1 : 0);
+
+  // horizontal intent (the wall-jump lock ignores input for 0.12 s)
+  if (p.lock > 0) {
+    p.lock -= dt;
+  } else {
+    const tgt = dir * RUN;
+    const a = ACCEL * (p.ground ? 1 : AIR_CTRL) * dt;
+    if (p.vx < tgt) p.vx = Math.min(tgt, p.vx + a);
+    else p.vx = Math.max(tgt, p.vx - a);
+  }
+
+  // jumps: ground/coyote jump, wall-jump, then double jump from a spark charge
+  if (p.jbuf > 0) {
+    if (p.ground || p.coyote > 0) {
+      p.vy = JUMP_V; p.ground = false; p.coyote = 0; p.jbuf = 0; p.cut = false;
+      ev.push({ type: 'jump' });
+    } else if (p.wall !== 0) {
+      p.vy = WALL_UP; p.vx = -p.wall * WALL_PUSH; p.lock = WALL_LOCK;
+      p.wall = 0; p.jbuf = 0; p.cut = false;
+      ev.push({ type: 'walljump' });
+    } else if (p.charges > 0) {
+      p.vy = DJ_V; p.charges--; p.jbuf = 0; p.cut = false;
+      ev.push({ type: 'dj' });
+    }
+  }
+  // variable height: releasing jump while rising cuts the upward speed once (armed by each jump; cut starts true)
+  if (!inp.held && !p.cut && p.vy > 0) { p.vy *= JUMP_CUT; p.cut = true; }
+
+  // gravity, wall slide (only while pressing into the wall), terminal velocity
+  p.vy -= GRAV * dt;
+  if (p.wall !== 0 && !p.ground && dir === p.wall && p.vy < -WALL_SLIDE) p.vy = -WALL_SLIDE;
+  if (p.vy < -MAX_FALL) p.vy = -MAX_FALL;
+
+  // horizontal move and wall contact (screen edges and pinch blocks)
+  p.x += p.vx * dt;
+  p.wall = 0;
+  if (p.x - half <= 0.5) { p.x = half; if (p.vx < 0) p.vx = 0; p.wall = -1; }
+  else if (p.x + half >= SW - 0.5) { p.x = SW - half; if (p.vx > 0) p.vx = 0; p.wall = 1; }
+  for (const b of world.blocks) {
+    if (!(p.y < b.y1 && p.y + PH > b.y0)) continue;
+    if (b.side < 0 && p.x - half < b.x1 + 0.5) { p.x = b.x1 + half; if (p.vx < 0) p.vx = 0; p.wall = -1; }
+    else if (b.side > 0 && p.x + half > b.x0 - 0.5) { p.x = b.x0 - half; if (p.vx > 0) p.vx = 0; p.wall = 1; }
+  }
+
+  // vertical move in substeps of at most 2 px, so no ledge can be tunnelled through
+  const dy = p.vy * dt;
+  const n = Math.max(1, Math.ceil(Math.abs(dy) / 2));
+  p.ground = false;
+  for (let i = 0; i < n; i++) {
+    const prevY = p.y;
+    p.y += dy / n;
+    if (p.vy <= 0) {
+      const hit = landOn(p, prevY, world);
+      if (hit) {
+        p.y = hit.y; p.vy = 0; p.ground = true;
+        if (!wasGround) ev.push({ type: 'land', ledge: hit });
+        break;
+      }
+    }
+  }
+  if (p.y > p.maxY) p.maxY = p.y;
+  return ev;
+}
+
+// True if some solid top (ledge or block) is at height y under x (used by one-thumb auto-run).
+function groundAt(world, x, y) {
+  for (const l of world.ledges) if (!l.gone && x >= l.x0 && x <= l.x1 && Math.abs(l.y - y) < 2) return true;
+  for (const b of world.blocks) if (x >= b.x0 && x <= b.x1 && Math.abs(b.y - y) < 2) return true;
+  return false;
+}
+
+// ---- 1f. crumble ledges, vents, sparks ----
+// Touching a crumble ledge starts a 0.5 s timer; it then drops out for 4 s and returns.
+function updateCrumbles(world, dt, landed) {
+  for (const l of world.ledges) {
+    if (l.kind !== 'crumble') continue;
+    if (l.gone) {
+      l.t -= dt;
+      if (l.t <= 0) { l.gone = false; l.state = 'solid'; }
+    } else if (l.state === 'shake') {
+      l.t -= dt;
+      if (l.t <= 0) { l.gone = true; l.state = 'gone'; l.t = CRUMBLE_RESPAWN; }
+    }
+  }
+  if (landed && landed.kind === 'crumble' && !landed.gone && landed.state === 'solid') {
+    landed.state = 'shake';
+    landed.t = CRUMBLE_T;
+  }
+}
+
+// Vent cycle: 1.2 s on, 1.5 s off, with a glow for the last 0.4 s before it turns on.
+function ventPhase(l, t) { return (t + l.ventPh) % VENT_CYCLE; }
+function ventActive(l, t) { return l.ventPh !== undefined && ventPhase(l, t) < VENT_ON; }
+function ventWarning(l, t) { return l.ventPh !== undefined && ventPhase(l, t) >= VENT_CYCLE - VENT_WARN; }
+function ventRect(l) { const cx = centerOf(l); return [cx - VENT_HALF, cx + VENT_HALF]; }
+function ventKills(p, world, t) {
+  const half = PW / 2;
+  for (const l of world.ledges) {
+    if (!ventActive(l, t)) continue;
+    const [vx0, vx1] = ventRect(l);
+    if (p.x + half > vx0 && p.x - half < vx1 && p.y < l.y + VENT_H && p.y + PH > l.y) return true;
+  }
+  return false;
+}
+
+// Collects sparks overlapping the sprite: +1 double-jump charge (max 2) and +1 spark count.
+function touchSparks(p, world) {
+  let n = 0;
+  for (const s of world.sparks) {
+    if (s.got) continue;
+    if (Math.abs(s.x - p.x) < PW / 2 + SPARK_R && s.y >= p.y - SPARK_R && s.y <= p.y + PH + SPARK_R) {
+      s.got = true; n++;
+      p.sparks++;
+      p.charges = Math.min(MAX_CHARGES, p.charges + 1);
+    }
+  }
+  return n;
+}
+
+// ---- 1g. ember tide ----
+// Starts 400 px below the start; speed 22 px/s plus 3 px/s per 500 px climbed (max 90).
+// More than 600 px above the embers doubles the speed until within 450 px (hysteresis).
+function makeTide(y) { return { y, rubber: false }; }
+function tideStep(tide, feetY, maxH, dt) {
+  let speed = Math.min(90, 22 + 3 * (maxH / 500));
+  const dist = feetY - tide.y;
+  if (dist > 600) tide.rubber = true;
+  else if (dist <= 450) tide.rubber = false;
+  if (tide.rubber) speed *= 2;
+  tide.y += speed * dt;
+  return tide;
+}
+
+// ---- 1h. one fixed step of a whole run (shared by the game and the test harness) ----
+function makeRun(seed) {
+  const world = createWorld(seed);
+  ensureWorld(world, 1200);
+  return { world, p: makePlayer(180, 0), tide: makeTide(-400), t: 0, maxH: 0, dead: null, sparks: 0 };
+}
+// Returns an array of events for the UI: {type:'land'|'jump'|'walljump'|'dj'|'spark'|'dead', ...}.
+function advance(gs, inp) {
+  const out = [];
+  if (gs.dead) return out;
+  const p = gs.p;
+  for (const e of stepPlayer(p, inp, gs.world)) out.push(e);
+  gs.t += DT;
+  ensureWorld(gs.world, p.y + 1200);
+  let landed = null;
+  for (const e of out) if (e.type === 'land') landed = e.ledge;
+  updateCrumbles(gs.world, DT, landed);
+  const got = touchSparks(p, gs.world);
+  for (let i = 0; i < got; i++) out.push({ type: 'spark' });
+  gs.sparks = p.sparks;
+  gs.maxH = Math.max(gs.maxH, p.maxY);
+  tideStep(gs.tide, p.y, gs.maxH, DT);
+  let cause = null;
+  if (p.y <= gs.tide.y) cause = 'tide';
+  else if (ventKills(p, gs.world, gs.t)) cause = 'vent';
+  if (cause) { gs.dead = cause; out.push({ type: 'dead', cause }); }
+  return out;
+}
+/*PURE-END*/
+
+/* ===== 2. audio: WebAudio synthesis, created on the first user input (muted before that) ===== */
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const audio = { ctx: null, master: null, whoosh: null, ok: false };
+function ensureAudio() {
+  try {
+    if (audio.ctx) { if (audio.ctx.state === 'suspended') audio.ctx.resume(); return; }
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    const c = new AC();
+    const master = c.createGain();
+    master.gain.value = 0.35;
+    master.connect(c.destination);
+    // looping filtered noise: the ember whoosh, louder as the tide nears
+    const len = c.sampleRate * 2;
+    const buf = c.createBuffer(1, len, c.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+    const src = c.createBufferSource();
+    src.buffer = buf; src.loop = true;
+    const bp = c.createBiquadFilter();
+    bp.type = 'bandpass'; bp.frequency.value = 600; bp.Q.value = 0.8;
+    const wg = c.createGain();
+    wg.gain.value = 0;
+    src.connect(bp); bp.connect(wg); wg.connect(master);
+    src.start();
+    audio.ctx = c; audio.master = master; audio.whoosh = wg; audio.ok = true;
+  } catch (e) { audio.ok = false; }
+}
+function tone(type, f0, f1, dur, vol, delay) {
+  if (!audio.ok) return;
+  const c = audio.ctx, t = c.currentTime + (delay || 0);
+  const o = c.createOscillator(), g = c.createGain();
+  o.type = type;
+  o.frequency.setValueAtTime(f0, t);
+  o.frequency.exponentialRampToValueAtTime(Math.max(20, f1), t + dur);
+  g.gain.setValueAtTime(vol, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g); g.connect(audio.master);
+  o.start(t); o.stop(t + dur + 0.02);
+}
+function noiseBurst(dur, vol, freq) {
+  if (!audio.ok) return;
+  const c = audio.ctx, t = c.currentTime;
+  const len = Math.max(1, Math.floor(c.sampleRate * dur));
+  const buf = c.createBuffer(1, len, c.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / len);
+  const s = c.createBufferSource(), f = c.createBiquadFilter(), g = c.createGain();
+  s.buffer = buf; f.type = 'bandpass'; f.frequency.value = freq;
+  g.gain.value = vol;
+  s.connect(f); f.connect(g); g.connect(audio.master);
+  s.start(t);
+}
+const SFX = {
+  jump: () => tone('square', 320, 620, 0.09, 0.12),
+  walljump: () => { tone('triangle', 380, 760, 0.12, 0.2); noiseBurst(0.08, 0.1, 1200); },
+  dj: () => tone('sine', 520, 980, 0.12, 0.2),
+  land: () => tone('sine', 140, 60, 0.07, 0.15),
+  spark: () => { tone('sine', 880, 880, 0.08, 0.18); tone('sine', 1320, 1320, 0.12, 0.16, 0.06); },
+  crumble: () => noiseBurst(0.25, 0.12, 2000),
+  death: () => { tone('sawtooth', 220, 40, 0.5, 0.2); noiseBurst(0.4, 0.25, 900); },
+  milestone: () => tone('triangle', 660, 990, 0.3, 0.2),
+};
+function sfx(name) { try { if (audio.ok && SFX[name]) SFX[name](); } catch (e) { /* audio is optional */ } }
+function setWhoosh(dist) {
+  try {
+    if (!audio.ok) return;
+    const g = Math.max(0, Math.min(1, 1 - dist / 500)) * 0.12;
+    audio.whoosh.gain.setTargetAtTime(g, audio.ctx.currentTime, 0.1);
+  } catch (e) { /* ignore */ }
+}
+
+/* ===== 3. state, input (keyboard + pointer/touch with multi-touch) ===== */
+const game = {
+  state: 'title', run: null, seed: 0, best: 0, oneThumb: false,
+  camY: 0, shake: 0, parts: [], banner: null, nextMilestone: 100,
+  dyingT: 0, cause: null, overAt: 0, autoDir: -1, lastInput: null, tapHold: 0,
+};
+const keys = { left: false, right: false, jump: false };
+let jumpQueued = false;
+const pointers = new Map();
+const ui = { pause: null, toggle: null, retry: null };
+const LEFT_KEYS = ['ArrowLeft', 'KeyA'], RIGHT_KEYS = ['ArrowRight', 'KeyD'], JUMP_KEYS = ['Space', 'ArrowUp', 'KeyW'];
+
+function loadBest() {
+  try { const v = parseInt(localStorage.getItem('sootSprite.best'), 10); return Number.isFinite(v) && v > 0 ? v : 0; }
+  catch (e) { return 0; }
+}
+function saveBest(v) {
+  try { localStorage.setItem('sootSprite.best', String(v)); } catch (e) { /* private mode: best just lasts this page */ }
+}
+function inRect(r, x, y) { return !!r && x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+
+function startRun() {
+  game.seed = ((Date.now() ^ Math.floor(Math.random() * 0x7fffffff)) >>> 0) || 1;
+  game.run = makeRun(game.seed);
+  game.camY = game.run.p.y - (canvas.height / devicePixelRatio / scale) * 0.4;
+  game.parts = [];
+  game.banner = null;
+  game.nextMilestone = 100;
+  game.dyingT = 0;
+  game.cause = null;
+  game.autoDir = -1;
+  keys.jump = false;
+  jumpQueued = false;
+  game.state = 'playing';
+  ensureAudio();
+}
+function setPaused(on) {
+  if (on && game.state === 'playing') game.state = 'paused';
+  else if (!on && game.state === 'paused') game.state = 'playing';
+}
+function togglePause() {
+  if (game.state === 'playing') game.state = 'paused';
+  else if (game.state === 'paused') game.state = 'playing';
+}
+
+function onKeyDown(e) {
+  const c = e.code;
+  ensureAudio();
+  if (LEFT_KEYS.includes(c)) keys.left = true;
+  else if (RIGHT_KEYS.includes(c)) keys.right = true;
+  else if (JUMP_KEYS.includes(c)) { keys.jump = true; if (!e.repeat) jumpQueued = true; }
+  if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(c)) e.preventDefault();
+  if ((c === 'Enter' || c === 'Space') && (game.state === 'title' || game.state === 'gameover')) {
+    // same 400 ms guard as the pointer path, so a jump key mashed at death does not skip the game-over card
+    if (!e.repeat && (game.state === 'title' || performance.now() - game.overAt > 400)) startRun();
+    return;
+  }
+  if (c === 'KeyP' || c === 'Escape') { if (!e.repeat) togglePause(); }
+}
+function onKeyUp(e) {
+  const c = e.code;
+  if (LEFT_KEYS.includes(c)) keys.left = false;
+  else if (RIGHT_KEYS.includes(c)) keys.right = false;
+  else if (JUMP_KEYS.includes(c)) keys.jump = false;
+}
+window.addEventListener('keydown', onKeyDown);
+window.addEventListener('keyup', onKeyUp);
+window.addEventListener('blur', () => { keys.left = keys.right = keys.jump = false; pointers.clear(); });
+document.addEventListener('visibilitychange', () => { if (document.hidden) setPaused(true); });
+
+function onPointerDown(e) {
+  e.preventDefault();
+  ensureAudio();
+  const x = e.clientX, y = e.clientY, s = game.state;
+  if (s === 'title') {
+    if (inRect(ui.toggle, x, y)) game.oneThumb = !game.oneThumb;
+    else startRun();
+    return;
+  }
+  if (s === 'gameover') { if (performance.now() - game.overAt > 400) startRun(); return; }
+  if (s === 'paused') { setPaused(false); return; }
+  if (s !== 'playing') return;
+  if (inRect(ui.pause, x, y)) { togglePause(); return; }
+  const q = { sx: x, sy: y, x, y, t: performance.now(), side: x < canvas.width / devicePixelRatio / 2 ? -1 : 1, jumpHold: false, moved: 0, jumped: false };
+  if (game.oneThumb) { jumpQueued = true; game.tapHold = 0.3; q.jumped = true; }
+  else if (pointers.size > 0) { jumpQueued = true; q.jumpHold = true; q.jumped = true; } // no minimum hold: a short tap is a low hop, a held finger a full one
+  pointers.set(e.pointerId, q);
+}
+function onPointerMove(e) {
+  const q = pointers.get(e.pointerId);
+  if (!q) return;
+  q.x = e.clientX; q.y = e.clientY;
+  q.moved = Math.max(q.moved, Math.hypot(q.x - q.sx, q.y - q.sy));
+  // swipe up anywhere jumps
+  if (!q.jumped && q.sy - q.y > 40 && performance.now() - q.t < 300) { jumpQueued = true; game.tapHold = 0.3; q.jumped = true; }
+}
+function onPointerUp(e) {
+  const q = pointers.get(e.pointerId);
+  if (!q) return;
+  pointers.delete(e.pointerId);
+  // a quick tap on either half while touching a wall also jumps
+  if (!q.jumped && !game.oneThumb && q.moved < 12 && performance.now() - q.t < 200 &&
+      game.state === 'playing' && game.run && game.run.p.wall !== 0) {
+    jumpQueued = true; game.tapHold = 0.3;
+  }
+}
+canvas.addEventListener('pointerdown', onPointerDown);
+window.addEventListener('pointermove', onPointerMove);
+window.addEventListener('pointerup', onPointerUp);
+window.addEventListener('pointercancel', onPointerUp);
+
+// Reads this fixed step's input. One-thumb mode auto-runs and taps jump; otherwise the halves steer.
+function readInput() {
+  let left = keys.left, right = keys.right, held = keys.jump;
+  if (game.oneThumb) {
+    left = game.autoDir < 0;
+    right = game.autoDir > 0;
+    if (pointers.size > 0) held = true;
+  } else {
+    for (const q of pointers.values()) {
+      if (q.side < 0) left = true; else right = true;
+      if (q.jumpHold) held = true;
+    }
+  }
+  // a touch jump is held for at least 0.3 s, so a quick tap still gives a full-height jump
+  if (game.tapHold > 0) { held = true; game.tapHold -= DT; }
+  const jump = jumpQueued;
+  jumpQueued = false;
+  return { left, right, held, jump };
+}
+
+/* ===== 4. game update (fixed step) ===== */
+function spawnParts(x, y, n, col, spread, up) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2;
+    const s = spread * (0.3 + Math.random() * 0.7);
+    game.parts.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s + (up || 0), life: 0.4 + Math.random() * 0.4, max: 0.8, col, r: 1.2 + Math.random() * 2.2 });
+  }
+}
+function stepParticles(dt) {
+  for (const q of game.parts) {
+    q.x += q.vx * dt; q.y += q.vy * dt; q.vy -= 300 * dt; q.life -= dt;
+  }
+  game.parts = game.parts.filter((q) => q.life > 0);
+}
+function updateAutoDir(run) {
+  const p = run.p;
+  if (p.wall !== 0) game.autoDir = -p.wall;
+  else if (p.ground && !groundAt(run.world, p.x + game.autoDir * (PW / 2 + 2), p.y)) game.autoDir = -game.autoDir;
+}
+function startDying(cause) {
+  game.state = 'dying';
+  game.cause = cause;
+  game.dyingT = 0.4;
+  sfx('death');
+  const p = game.run.p;
+  spawnParts(p.x, p.y + 9, 28, '#3a3232', 90, 40);
+  game.shake = 6;
+}
+function finishRun() {
+  const run = game.run;
+  const m = Math.floor(Math.max(0, run.maxH) / 10);
+  if (m > game.best) { game.best = m; saveBest(m); }
+  game.state = 'gameover';
+  game.overAt = performance.now();
+}
+function score() {
+  const run = game.run;
+  return run ? Math.floor(Math.max(0, run.maxH) / 10) + 25 * run.sparks : 0;
+}
+
+function update() {
+  if (game.state === 'dying') {
+    game.dyingT -= DT;
+    stepParticles(DT * 0.4);
+    if (game.dyingT <= 0) finishRun();
+    return;
+  }
+  if (game.state !== 'playing') return;
+  const run = game.run;
+  const inp = readInput();
+  game.lastInput = inp;
+  if (game.oneThumb) updateAutoDir(run);
+  const evs = advance(run, inp);
+  let landed = null;
+  for (const e of evs) {
+    switch (e.type) {
+      case 'jump': sfx('jump'); squash(0.7, 1.3); spawnParts(run.p.x, run.p.y, 4, '#4a4040', 40); break;
+      case 'walljump': sfx('walljump'); squash(0.75, 1.25); spawnParts(run.p.x, run.p.y + 9, 9, '#555', 70); break;
+      case 'dj': sfx('dj'); squash(0.8, 1.2); spawnParts(run.p.x, run.p.y + 9, 10, '#ffcf4d', 80); break;
+      case 'land': sfx('land'); landed = e.ledge; squash(1.3, 0.75); break;
+      case 'spark': sfx('spark'); spawnParts(run.p.x, run.p.y + 12, 12, '#ffcf4d', 110); break;
+      case 'dead': startDying(e.cause); break;
+    }
+  }
+  if (landed && landed.kind === 'crumble') { sfx('crumble'); spawnParts(run.p.x, landed.y, 8, '#6b4a33', 60, 30); }
+  const m = Math.floor(run.maxH / 10);
+  if (m >= game.nextMilestone) {
+    game.banner = { text: game.nextMilestone + ' m', t: 1.8 };
+    game.nextMilestone += 100;
+    sfx('milestone');
+  }
+  if (game.banner) { game.banner.t -= DT; if (game.banner.t <= 0) game.banner = null; }
+  stepParticles(DT);
+  if (game.squash) { game.squash.t -= DT; if (game.squash.t <= 0) game.squash = null; }
+  // camera only climbs, so the view never drops back toward the embers
+  const vh = canvas.height / devicePixelRatio / scale;
+  game.camY = Math.max(game.camY, run.p.y - vh * 0.4);
+  if (game.shake > 0) game.shake = Math.max(0, game.shake - DT * 30);
+}
+function squash(sx, sy) { game.squash = { sx, sy, t: 0.14, s0x: sx, s0y: sy }; }
+
+/* ===== 5. rendering: canvas is CSS-sized to the viewport, backing store x devicePixelRatio ===== */
+let cssW = 0, cssH = 0, dpr = 1, scale = 1, offX = 0;
+function layout() {
+  cssW = window.innerWidth;
+  cssH = window.innerHeight;
+  dpr = window.devicePixelRatio || 1;
+  canvas.style.width = cssW + 'px';
+  canvas.style.height = cssH + 'px';
+  canvas.width = Math.round(cssW * dpr);
+  canvas.height = Math.round(cssH * dpr);
+  scale = Math.min(cssW / SW, cssH / 520);   // the shaft always spans the width; never shows less than ~520 px of height
+  offX = (cssW - SW * scale) / 2;
+}
+// World transform: x right, y up, camY at the bottom edge of the screen, shake offset applied.
+function worldTransform(camY, shakeX, shakeY) {
+  ctx.setTransform(dpr * scale, 0, 0, -dpr * scale, dpr * (offX + shakeX), dpr * (cssH + camY * scale + shakeY));
+}
+function hudTransform() { ctx.setTransform(dpr, 0, 0, dpr, 0, 0); }
+function clamp01(v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
+
+function drawBricks(camY, vh) {
+  const x0 = -offX / scale - 40, x1 = SW + offX / scale + 40;
+  ctx.fillStyle = '#2a1a17';
+  ctx.fillRect(x0, camY - 20, x1 - x0, vh + 40);
+  const ROW = 14, BW = 30;
+  const r0 = Math.floor((camY - 20) / ROW), r1 = Math.ceil((camY + vh + 20) / ROW);
+  ctx.strokeStyle = '#150c0a';
+  ctx.lineWidth = 1.2;
+  ctx.beginPath();
+  for (let r = r0; r <= r1; r++) {
+    const y = r * ROW, off = (r & 1) ? BW / 2 : 0;
+    ctx.moveTo(x0, y); ctx.lineTo(x1, y);
+    for (let x = Math.floor((x0 - off) / BW) * BW + off; x < x1; x += BW) { ctx.moveTo(x, y); ctx.lineTo(x, y + ROW); }
+  }
+  ctx.stroke();
+  // soot haze at the top of the visible shaft
+  const g = ctx.createLinearGradient(0, camY, 0, camY + vh);
+  g.addColorStop(0, 'rgba(10,6,5,0.0)');
+  g.addColorStop(1, 'rgba(10,6,5,0.35)');
+  ctx.fillStyle = g;
+  ctx.fillRect(x0, camY, x1 - x0, vh);
+}
+function drawBlock(b) {
+  // dark face so the flue walls read against the brick; a lit 4 px strip marks the shaft-facing edge
+  ctx.fillStyle = '#120a08';
+  ctx.fillRect(b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0);
+  ctx.fillStyle = '#5b3c31';
+  const edgeX = b.side < 0 ? b.x1 - 4 : b.x0;
+  ctx.fillRect(edgeX, b.y0, 4, b.y1 - b.y0);
+  ctx.strokeStyle = '#1c110e';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let y = b.y0 + 7; y < b.y1; y += 14) { ctx.moveTo(b.x0, y); ctx.lineTo(b.x1, y); }
+  ctx.stroke();
+}
+function drawLedge(l, t) {
+  let ox = 0;
+  if (l.kind === 'crumble' && l.state === 'shake') ox = Math.sin(t * 70) * 1.6;
+  if (l.kind === 'crumble' && l.gone) return;
+  const x = l.x0 + ox, w = l.x1 - l.x0;
+  ctx.fillStyle = l.kind === 'crumble' ? '#4e3322' : '#4a3129';
+  ctx.fillRect(x, l.y - 8, w, 8);
+  // bright top highlight so the ledge tops read against the dark soot
+  ctx.fillStyle = l.kind === 'crumble' ? '#b3845f' : '#9a6e58';
+  ctx.fillRect(x, l.y - 3, w, 3);
+  // soot blotches and mortar, placed by a hash of the ledge position so they never shimmer
+  ctx.fillStyle = '#0c0706';
+  for (let i = 0; i < 3; i++) {
+    const hx = Math.abs(Math.sin(l.x0 * 12.9898 + i * 78.233)) % 1;
+    ctx.fillRect(x + 4 + hx * (w - 14), l.y - 7, 6 + hx * 4, 2);
+  }
+  ctx.strokeStyle = '#150c0a';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let mx = x + 14; mx < x + w - 4; mx += 22) { ctx.moveTo(mx, l.y - 8); ctx.lineTo(mx, l.y); }
+  if (l.kind === 'crumble') {
+    ctx.moveTo(x + w * 0.3, l.y - 2); ctx.lineTo(x + w * 0.42, l.y - 7); ctx.lineTo(x + w * 0.5, l.y - 3);
+    ctx.moveTo(x + w * 0.7, l.y - 8); ctx.lineTo(x + w * 0.66, l.y - 4);
+  }
+  ctx.stroke();
+}
+// vt = the run's sim time, the same clock ventKills uses, so the telegraph and flames match the kill window
+function drawVent(l, t, vt) {
+  const cx = centerOf(l), vx0 = cx - VENT_HALF, vx1 = cx + VENT_HALF;
+  if (ventWarning(l, vt)) {
+    const a = 0.25 + 0.2 * Math.sin(t * 18);
+    const g = ctx.createRadialGradient(cx, l.y + 6, 2, cx, l.y + 6, 34);
+    g.addColorStop(0, 'rgba(255,106,43,' + (a + 0.25) + ')');
+    g.addColorStop(1, 'rgba(255,106,43,0)');
+    ctx.fillStyle = g;
+    ctx.fillRect(cx - 34, l.y - 26, 68, 52);
+  }
+  ctx.fillStyle = '#2a2222';
+  ctx.fillRect(vx0, l.y, vx1 - vx0, 3);
+  if (ventActive(l, vt)) {
+    for (let i = 0; i < 4; i++) {
+      const fx = vx0 + 3 + i * 5.5, h = 9 + 4 * Math.abs(Math.sin(t * 22 + i * 1.7));
+      ctx.fillStyle = '#ff3d2e';
+      ctx.beginPath(); ctx.moveTo(fx, l.y + 3); ctx.lineTo(fx + 3, l.y + 3 + h); ctx.lineTo(fx + 6, l.y + 3); ctx.fill();
+      ctx.fillStyle = '#ffd27a';
+      ctx.beginPath(); ctx.moveTo(fx + 1.5, l.y + 3); ctx.lineTo(fx + 3, l.y + 3 + h * 0.5); ctx.lineTo(fx + 4.5, l.y + 3); ctx.fill();
+    }
+  }
+}
+function drawSpark(s, t) {
+  const r = SPARK_R * (0.85 + 0.15 * Math.sin(t * 8 + s.x));
+  ctx.save();
+  ctx.shadowColor = '#ffcf4d';
+  ctx.shadowBlur = 14;
+  ctx.fillStyle = '#ffcf4d';
+  ctx.beginPath(); ctx.arc(s.x, s.y, r * 0.5, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+  ctx.strokeStyle = 'rgba(255,240,190,0.8)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(s.x - r, s.y); ctx.lineTo(s.x + r, s.y); ctx.moveTo(s.x, s.y - r); ctx.lineTo(s.x, s.y + r);
+  ctx.stroke();
+}
+// The ember tide: a gradient mass below its wavy surface, a glow above it and heat shimmer lines.
+function drawTide(tide, camY, vh, t) {
+  const bottom = camY - 300;
+  const wave = (x) => 4 * Math.sin(x * 0.09 + t * 3) + 2.5 * Math.sin(x * 0.23 - t * 5);
+  const top = tide.y + 120;
+  const glow = ctx.createLinearGradient(0, tide.y, 0, top);
+  glow.addColorStop(0, 'rgba(255,106,43,0.35)');
+  glow.addColorStop(1, 'rgba(255,106,43,0)');
+  ctx.fillStyle = glow;
+  ctx.fillRect(-40, tide.y, SW + 80, 120);
+  const g = ctx.createLinearGradient(0, tide.y + 6, 0, tide.y - 260);
+  g.addColorStop(0, '#ffd27a');
+  g.addColorStop(0.25, '#ff6a2b');
+  g.addColorStop(1, '#3a0c08');
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.moveTo(-20, bottom);
+  for (let x = -20; x <= SW + 20; x += 10) ctx.lineTo(x, tide.y + wave(x));
+  ctx.lineTo(SW + 20, bottom);
+  ctx.closePath();
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255,210,122,0.18)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let i = 0; i < 4; i++) {
+    const y0 = tide.y + 14 + i * 11;
+    for (let x = 0; x <= SW; x += 8) {
+      const y = y0 + 2 * Math.sin(x * 0.2 + t * 6 + i);
+      if (x === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+  }
+  ctx.stroke();
+}
+// The sprite, drawn at its feet with squash and stretch. dir = facing (-1 or 1).
+function drawSprite(x, y, t, dir, charges, sq) {
+  ctx.save();
+  ctx.translate(x, y);
+  if (sq) {
+    const f = Math.max(0, sq.t / 0.14);
+    ctx.scale(1 + (sq.sx - 1) * f, 1 + (sq.sy - 1) * f);
+  }
+  ctx.fillStyle = '#111';
+  for (let i = 0; i < 7; i++) {
+    const a = (i / 7) * Math.PI * 2 + t * 0.7;
+    ctx.beginPath();
+    ctx.arc(Math.cos(a) * 6, 9 + Math.sin(a) * 6, 3.4 + Math.sin(t * 9 + i * 2.3) * 0.5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.beginPath(); ctx.arc(0, 9, 8, 0, Math.PI * 2); ctx.fill();
+  const blink = t % 3 < 0.1;
+  ctx.fillStyle = '#fff';
+  for (const ex of [-3, 3]) {
+    ctx.save();
+    ctx.translate(ex + dir * 0.8, 11);
+    ctx.scale(1, blink ? 0.1 : 1);
+    ctx.beginPath(); ctx.arc(0, 0, 2.7, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+  if (!blink) {
+    ctx.fillStyle = '#111';
+    for (const ex of [-3, 3]) { ctx.beginPath(); ctx.arc(ex + dir * 1.6, 11, 1.2, 0, Math.PI * 2); ctx.fill(); }
+  }
+  // double-jump charges orbit the sprite
+  for (let i = 0; i < charges; i++) {
+    const a = t * 3 + i * Math.PI;
+    ctx.fillStyle = '#ffcf4d';
+    ctx.beginPath(); ctx.arc(Math.cos(a) * 13, 9 + Math.sin(a) * 13, 2.2, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.restore();
+}
+function drawParticles() {
+  for (const q of game.parts) {
+    ctx.globalAlpha = clamp01(q.life / q.max);
+    ctx.fillStyle = q.col;
+    ctx.beginPath(); ctx.arc(q.x, q.y, q.r, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+/* ===== 6. HUD, overlays and the frame loop ===== */
+function fontPx(base) { return Math.round(Math.max(base * 0.75, Math.min(base * 1.25, cssW / 15))); }
+function drawHud(run, t) {
+  const p = run.p, m = Math.floor(run.maxH / 10);
+  const fs = fontPx(26);
+  hudTransform();
+  ctx.textBaseline = 'top';
+  ctx.textAlign = 'left';
+  ctx.font = '800 ' + fs + 'px system-ui, sans-serif';
+  ctx.fillStyle = '#f6eee6';
+  ctx.fillText(m + ' m', 14, 12);
+  // spark count and charges
+  ctx.font = '600 ' + fontPx(14) + 'px system-ui, sans-serif';
+  ctx.fillStyle = '#ffcf4d';
+  ctx.fillText('sparks ' + run.sparks + '   charges ' + p.charges, 14, 12 + fs + 6);
+  // distance to the embers
+  const d = Math.max(0, p.y - run.tide.y);
+  const frac = clamp01(1 - d / 600);
+  const bw = Math.min(160, cssW * 0.4), bx = 14, by = cssH - 26;
+  ctx.fillStyle = 'rgba(0,0,0,0.45)';
+  ctx.fillRect(bx, by, bw, 8);
+  ctx.fillStyle = frac > 0.6 ? '#ff3d2e' : '#ff6a2b';
+  ctx.fillRect(bx, by, bw * frac, 8);
+  ctx.font = '600 ' + fontPx(12) + 'px system-ui, sans-serif';
+  ctx.fillStyle = '#f6eee6';
+  ctx.fillText('embers ' + Math.round(d) + ' px', bx, by - 18);
+  // pause button
+  ui.pause = { x: cssW - 52, y: 14, w: 38, h: 38 };
+  ctx.fillStyle = 'rgba(0,0,0,0.45)';
+  ctx.fillRect(ui.pause.x, ui.pause.y, ui.pause.w, ui.pause.h);
+  ctx.fillStyle = '#f6eee6';
+  ctx.fillRect(ui.pause.x + 12, ui.pause.y + 10, 4, 18);
+  ctx.fillRect(ui.pause.x + 22, ui.pause.y + 10, 4, 18);
+  // milestone banner
+  if (game.banner) {
+    const a = clamp01(game.banner.t / 0.5);
+    ctx.globalAlpha = a;
+    ctx.textAlign = 'center';
+    ctx.font = '800 ' + fontPx(40) + 'px system-ui, sans-serif';
+    ctx.fillStyle = '#ffd27a';
+    ctx.fillText(game.banner.text, cssW / 2, cssH * 0.28);
+    ctx.globalAlpha = 1;
+  }
+}
+// Overlay priority: game over > pause > other. Each overlay is dismissible by touch.
+function drawCard(lines, title) {
+  hudTransform();
+  ctx.fillStyle = 'rgba(10,6,5,0.6)';
+  ctx.fillRect(0, 0, cssW, cssH);
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#ffd27a';
+  ctx.font = '800 ' + fontPx(38) + 'px system-ui, sans-serif';
+  ctx.fillText(title, cssW / 2, cssH * 0.3);
+  ctx.fillStyle = '#f6eee6';
+  ctx.font = '600 ' + fontPx(18) + 'px system-ui, sans-serif';
+  lines.forEach((ln, i) => ctx.fillText(ln, cssW / 2, cssH * 0.3 + 46 + i * 28));
+}
+function drawGameOver(run) {
+  const m = Math.floor(run.maxH / 10);
+  const cause = game.cause === 'vent' ? 'Scorched by a vent' : 'Swallowed by the embers';
+  drawCard(['Climbed ' + m + ' m', 'Sparks ' + run.sparks + '   Score ' + score(), 'Best ' + Math.max(game.best, m) + ' m', cause], 'Ash');
+  const r = { x: cssW / 2 - 110, y: cssH * 0.3 + 150, w: 220, h: 50 };
+  ui.retry = r;
+  ctx.fillStyle = '#ff6a2b';
+  ctx.fillRect(r.x, r.y, r.w, r.h);
+  ctx.fillStyle = '#120c0b';
+  ctx.font = '800 ' + fontPx(18) + 'px system-ui, sans-serif';
+  ctx.fillText('Retry (Enter)', cssW / 2, r.y + r.h / 2);
+}
+// Draws text centred at (x, y), shrinking the font until it fits maxW (keeps phone widths clean).
+function fitText(str, x, y, maxW, px, weight) {
+  let size = px;
+  do {
+    ctx.font = weight + ' ' + Math.round(size) + 'px system-ui, sans-serif';
+    if (ctx.measureText(str).width <= maxW || size <= 10) break;
+    size -= 0.5;
+  } while (true);
+  ctx.fillText(str, x, y);
+}
+function drawTitle(t) {
+  hudTransform();
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#ffd27a';
+  ctx.font = '800 ' + fontPx(44) + 'px system-ui, sans-serif';
+  ctx.fillText('SOOT SPRITE', cssW / 2, cssH * 0.14);
+  ctx.fillStyle = '#f6eee6';
+  ctx.font = '600 ' + fontPx(16) + 'px system-ui, sans-serif';
+  fitText('Wall-jump up the chimney before the embers catch you.', cssW / 2, cssH * 0.14 + 40, cssW - 32, fontPx(16), '600');
+  const lines = [
+    'Move: hold left / right half of the screen (or Arrow keys / A D)',
+    'Jump: tap with a second finger, or swipe up (or Space / Up / W)',
+    'Hold jump for a higher leap. Tap while touching a wall to wall-jump.',
+    'Grab sparks for double-jump charges. P or Esc pauses.',
+  ];
+  lines.forEach((ln, i) => fitText(ln, cssW / 2, cssH * 0.27 + i * 26, cssW - 32, fontPx(14), '500'));
+  const tg = { x: cssW / 2 - 130, y: cssH * 0.5, w: 260, h: 46 };
+  ui.toggle = tg;
+  ctx.fillStyle = game.oneThumb ? '#ff6a2b' : 'rgba(246,238,230,0.12)';
+  ctx.fillRect(tg.x, tg.y, tg.w, tg.h);
+  ctx.fillStyle = '#f6eee6';
+  ctx.font = '800 ' + fontPx(16) + 'px system-ui, sans-serif';
+  ctx.fillText('One-thumb mode: ' + (game.oneThumb ? 'ON' : 'OFF'), cssW / 2, tg.y + tg.h / 2);
+  ctx.font = '600 ' + fontPx(16) + 'px system-ui, sans-serif';
+  ctx.fillStyle = '#ffcf4d';
+  ctx.fillText('Best ' + game.best + ' m', cssW / 2, cssH * 0.5 + 80);
+  ctx.fillStyle = '#f6eee6';
+  ctx.fillText('Tap or press Enter to climb', cssW / 2, cssH * 0.5 + 110);
+}
+
+function render(now) {
+  const t = now / 1000;
+  const run = game.run;
+  const camY = run ? game.camY : -90;
+  const vh = cssH / scale;
+  const sx = game.shake > 0 ? (Math.random() - 0.5) * game.shake : 0;
+  const sy = game.shake > 0 ? (Math.random() - 0.5) * game.shake : 0;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = '#120c0b';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  worldTransform(camY, sx, sy);
+  drawBricks(camY, vh);
+  ui.pause = null; ui.retry = null; ui.toggle = null;
+  if (!run) {
+    // title scene: the sprite idles on a ledge at the bottom of the screen
+    ctx.fillStyle = '#3d2820';
+    ctx.fillRect(90, -8, 180, 8);
+    ctx.fillStyle = '#5b3c31';
+    ctx.fillRect(90, -2, 180, 2);
+    drawSprite(180, 0, t, 1, 0, null);
+    drawTitle(t);
+  } else {
+    const vis = (y) => y > camY - 60 && y < camY + vh + 60;
+    for (const b of run.world.blocks) if (vis(b.y1)) drawBlock(b);
+    for (const l of run.world.ledges) {
+      if (!vis(l.y)) continue;
+      if (l.ventPh !== undefined) { drawLedge(l, t); drawVent(l, t, run.t); }
+      else drawLedge(l, t);
+    }
+    for (const s of run.world.sparks) if (!s.got && vis(s.y)) drawSpark(s, t);
+    if (game.best > 0 && game.best * 10 > camY && game.best * 10 < camY + vh) {
+      ctx.setLineDash([6, 6]);
+      ctx.strokeStyle = 'rgba(255,207,77,0.55)';
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(0, game.best * 10); ctx.lineTo(SW, game.best * 10); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    drawTide(run.tide, camY, vh, t);
+    drawParticles();
+    if (game.state !== 'dying' && game.state !== 'gameover') {
+      drawSprite(run.p.x, run.p.y, t, game.lastInput && game.lastInput.left ? -1 : 1, run.p.charges, game.squash);
+      const d = run.p.y - run.tide.y;
+      if (d < 150) {
+        hudTransform();
+        const a = (150 - d) / 150 * 0.45;
+        const g = ctx.createRadialGradient(cssW / 2, cssH / 2, cssH * 0.3, cssW / 2, cssH / 2, cssH * 0.75);
+        g.addColorStop(0, 'rgba(255,60,30,0)');
+        g.addColorStop(1, 'rgba(255,60,30,' + a + ')');
+        ctx.fillStyle = g;
+        ctx.fillRect(0, 0, cssW, cssH);
+        worldTransform(camY, sx, sy);
+      }
+    }
+    if (game.state === 'playing' || game.state === 'paused' || game.state === 'dying') drawHud(run, t);
+    if (game.state === 'gameover') drawGameOver(run);
+    else if (game.state === 'paused') {
+      drawHud(run, t);
+      drawCard(['Tap, P or Esc to resume'], 'Paused');
+    }
+  }
+  hudTransform();
+  window.__game = { state: game.state, score: score(), height: run ? Math.floor(run.maxH / 10) : 0, sparks: run ? run.sparks : 0, best: game.best, seed: game.seed };
+}
+
+let lastFrame = performance.now(), acc = 0;
+function frame(now) {
+  let dt = (now - lastFrame) / 1000;
+  lastFrame = now;
+  if (!(dt >= 0)) dt = 0;
+  if (dt > 0.05) dt = 0.05;     // clamp so a stalled tab cannot break the physics
+  if (game.state === 'playing' || game.state === 'dying') {
+    acc += dt;
+    while (acc >= DT) { update(); acc -= DT; }
+  } else {
+    acc = 0;
+  }
+  render(now);
+  requestAnimationFrame(frame);
+}
+game.best = loadBest();
+layout();
+window.addEventListener('resize', layout);
+window.__game = { state: 'title', score: 0, height: 0, sparks: 0, best: game.best, seed: 0 };
+requestAnimationFrame((now) => { lastFrame = now; frame(now); });
+</script>
+</body>
+</html>
