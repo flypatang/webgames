@@ -25,7 +25,7 @@ Between waves, spend seeds on hedges (cheap; they reroute the path) and gnome to
 ## Build items (costs in seeds)
 | Item | Cost | Effect | Upgrades (Lv2 / Lv3) |
 |---|---|---|---|
-| Hedge | 2 | blocks the path; can be built on later? No: hedges are separate cells. A gnome can only be placed ON a hedge (it converts the hedge) | – |
+| Hedge | 1 | blocks the path. Gnomes can only be placed ON a hedge (the hedge stays underneath, with its own invested amount); a hedge under a gnome can't be sold until the gnome is sold | – |
 | Pebble Gnome | 10 (+8 if no hedge underneath: auto-places a hedge) | single target, range 2.5 cells, 1 dmg, 0.6 s fire rate | 15: 2 dmg · 25: 3 dmg + range 3 |
 | Frost Gnome | 15 | slows by 40% for 1.5 s, range 2 cells, 0.3 dmg, 1 s rate | 20: slow 55% · 30: also slows 2 nearby critters |
 | Bell Gnome | 20 | area pulse every 2 s, 1.5 dmg to all within 1.5 cells | 25: 2.5 dmg · 35: radius 2 |
@@ -33,12 +33,12 @@ Between waves, spend seeds on hedges (cheap; they reroute the path) and gnome to
 Gnomes target the critter **furthest along the path** within range.
 
 ## Critters (waves)
-- Wave w composition from a table (and a formula after wave 10): Slug (HP 4, speed 1.0 cells/s, 1 seed), Beetle (HP 10, speed 0.7, armored: −0.5 per hit, min 0.3, 2 seeds), Hare (HP 3, speed 2.0, 2 seeds), Mole (HP 8, speed 0.9, from wave 6: ignores hedges, walks straight down the column (but not gnomes) — it must be shot, 3 seeds), Boss Badger every 5th wave (HP 60 + 30·(w/5−1), speed 0.5, 15 seeds).
-- HP scale per wave: × (1 + 0.12·(w−1)). Count: 8 + 2w (max 40) for normal waves. Spawn interval 0.8 s.
+- Wave w composition from a table (and a formula after wave 10): Slug (HP 4, speed 1.0 cells/s, 1 seed), Beetle (HP 10, speed 0.7, armored: −0.5 per hit, min 0.3, 2 seeds), Hare (HP 3, speed 2.0, 2 seeds), Mole (HP 8, speed 0.9, from wave 6: ignores hedges, BFS-paths through hedges but around gnomes, 3 seeds), Boss Badger every 5th wave (base HP 40 + 30·(w/5−1), then the wave HP scale; speed 0.5, 15 seeds).
+- HP scale per wave: × 1.11^(w−1). Armor: a flat −0.5 per hit, with a 0.3 floor. Count: 8 + 2w (max 40) for normal waves. Spawn interval 0.8 s.
 - Waves 1–10 table: 1 slugs; 2 slugs; 3 slugs+hares; 4 beetles+slugs; 5 boss + slugs; 6 moles+slugs; 7 hares+beetles; 8 mixed; 9 beetles+moles; 10 boss + mixed. After 10: a random mix, weighted by the unlocked types.
 
 ## Economy
-Start 40 seeds, 20 lives. A critter reaching the exit costs 1 life (boss: 5). Wave clear bonus: 5 + w. Calling the next wave early: +1 seed per remaining second of the 20 s build timer. (The build phase auto-ends after 20 s; the first build phase is unlimited until the player presses Next.)
+Start 50 seeds, 20 lives. A critter reaching the exit costs 1 life (boss: 5). Wave clear bonus: 8 + 2w. Building is allowed during waves; critters block building on their current and next cell. Calling the next wave early: +1 seed per remaining second of the 20 s build timer. (The build phase auto-ends after 20 s; the first build phase is unlimited until the player presses Next.)
 
 ## Win / lose
 Endless waves; game over at 0 lives. Score = waves cleared × 100 + kills. Best wave and score in localStorage `hedgewise.best`.
@@ -58,6 +58,6 @@ Endless waves; game over at 0 lives. Score = waves cleared × 100 + kills. Best 
 - [ ] Targeting = furthest along the path; frost slow and armor work; the bell hits all in radius.
 - [ ] The economy, upgrade and sell refunds are exact.
 - [ ] The early-call bonus and the build timer work; ×2 speed doesn't break physics (use a fixed timestep).
-- [ ] Balance evidence (seeded harness, ≥ 20 runs): a scripted "reasonable" strategy (a serpentine hedge maze + mixed gnomes) reaches a median wave 12–20; a no-maze strategy (gnomes only beside the straight path) reaches a median wave 5–9.
+- [ ] Balance evidence (seeded harness, ≥ 20 runs): a scripted "reasonable" strategy (a serpentine hedge maze built incrementally, about one wall segment per wave alongside gnomes and upgrades) reaches a median wave 12–20; a no-maze strategy (gnomes only beside the straight path) reaches a median wave 5–9.
 - [ ] Fully playable by touch at 375 px (tap-confirm placement, readable toolbar).
 - [ ] Restart resets everything; best persists.
