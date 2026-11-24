@@ -53,6 +53,6 @@ Score = max height climbed (in "meters" = px/10) + 25 per spark. Milestone banne
 - [ ] Every generated segment is solvable (reachability check; fuzz 2000 segments with zero unsolvable).
 - [ ] Crumble ledges, vents (with a telegraph) and the open drop + guaranteed spark behave per spec.
 - [ ] The ember tide speed/rubber-banding works; death and restart are clean.
-- [ ] Balance evidence (seeded harness, ≥ 20 runs): a scripted climber bot that follows the reachability path with human-like 120 ms input delay reaches a median of 150–400 m; it never dies to an unsolvable segment.
+- [ ] Balance evidence (seeded harness, ≥ 20 runs): an exact-foresight macro planner with a 120 ms input delay (an upper bound) reaches a median of ~300–500 m, implying ~150–300 m for a competent human; it never dies to an unsolvable segment. (Reviewer measurement: median 432 m, ~71 px/s.) If the tide ever feels too easy, narrow the flues (90–105) rather than speeding up the tide.
 - [ ] Touch: both the two-zone mode and the one-thumb mode are playable at 375 px; multi-touch (hold right + tap jump) works.
 - [ ] Restart resets everything; best persists.
