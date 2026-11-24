@@ -1,0 +1,1187 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<link rel="icon" href="data:,">
+<title>Orbit Courier</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+  canvas { position: fixed; left: 0; top: 0; display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* ==========================================================================
+   ORBIT COURIER
+   Single-file canvas game. Logical playfield 480x800 (portrait), scaled to fit.
+   Sections: 1 config · 2 state & utils · 3 world generation · 4 physics
+             5 rules · 6 audio · 7 input · 8 rendering · 9 main loop
+   ========================================================================== */
+
+/* ---------- 1. CONFIG ---------- */
+const LW = 480, LH = 800;             // logical playfield
+const STEP = 1 / 120;                 // fixed physics step (s)
+const TAU = Math.PI * 2;
+const DRONE_R = 6;
+const CRASH_PAD = 6;                  // touching = d < r + 6
+const WELL_K = 4;                     // gravity reaches r * 4
+const G_BASE = 300000;                // G*m at planet r = 30
+const MAX_SPEED = 420;
+const THRUST_A = 120;                 // px/s^2 along velocity
+const THRUST_FUEL = 10;               // extra fuel/s while thrusting
+const FUEL_START = 100, FUEL_MAX = 100, FUEL_PER_DELIVERY = 40, FUEL_LOW = 25;
+const LIVES_START = 3;
+const CAPTURE_BAND = 10;              // capture if |d - orbitR| <= 10
+const RELEASE_GRACE = 0.6;            // s before the just-left planet may capture
+const PRED_T = 1.8;                   // trajectory preview length (s)
+const INVULN = 0.8;                   // s after respawn
+const LOST_PAD = 60;                  // off-screen margin before a life is lost
+const CAM_LEAD = 520;                 // drone's screen y (~65% of 800)
+const ASTEROID_SCORE = 600;
+const GUARD_OVER = 0.6;               // s before game-over accepts a restart
+const SHAKE_DUR = 0.3;
+const PAUSE_BTN = { x: 416, y: 8, w: 52, h: 32 };
+const START = { x: 240, y: 560, r: 30 };
+const BEST_KEY = 'orbitCourier.best';
+const C = {
+  top: '#0b1026', bot: '#1b1446',
+  drone: '#7cf7ff', target: '#ffd166', danger: '#ff4d6d', text: '#f4f6ff'
+};
+const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
+
+/* ---------- 2. STATE & UTILS ---------- */
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const layout = { dpr: 1, s: 1, ox: 0, oy: 0 };
+
+// Exposed for the smoke test and debugging; kept current in render().
+const game = window.__game = { state: 'title', score: 0, lives: LIVES_START, fuel: FUEL_START, deliveries: 0, best: 0, time: 0, deaths: [] };
+
+const rand = (a, b) => a + Math.random() * (b - a);
+const randInt = (a, b) => Math.floor(rand(a, b + 1));
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const mod = (v, m) => ((v % m) + m) % m;
+const easeOut = k => 1 - (1 - k) * (1 - k);
+
+let state = 'title';                  // title | playing | paused | over
+let best = loadBest();
+let newBest = false;
+let overT = 0;
+let elapsed = 0;                      // total animation time (s)
+let stepCount = 0;
+let titleAngle = 0;
+
+let score = 0, combo = 1, lives = LIVES_START, fuel = FUEL_START;
+let deliveries = 0, interCaptures = 0;
+let lastThrusting = false;
+let simTime = 0;                      // simulated game time (s), advanced only by fixed steps
+let deaths = [];                      // causes of lost lives this run: 'surface' | 'asteroid' | 'offscreen'
+let captures = 0;                     // planet captures this run
+let highestId = 0;                    // highest planet id captured this run (id increases upward)
+let overReason = null;                // 'lives' | 'fuel'
+let misses = { capture: 0, respawn: 0, belowScreen: 0 };   // overshoot events by cause
+
+let planets = [], stars = [], asteroids = [];
+let particles = [], texts = [], rings = [];
+let bgStars = [];
+let drone = null;                     // { x, y, vx, vy, mode:'orbit'|'flight', planet, angle, dir, trail, inv, justLeft, flightT }
+let lastPlanet = null;                // planet the drone last orbited (respawn point)
+let target = null;                    // delivery planet
+let camY = 0;                         // world y at the top of the screen (only ever decreases)
+let shake = { t: 0, mag: 0 };
+
+let holdSpace = false, holdUp = false, holdPointer = false;
+let thrustBlocked = false;            // true after a press that released/started in orbit, until all holds are up
+let audio = null;
+
+const scrY = wy => wy - camY;
+
+function loadBest() {
+  try {
+    const v = parseInt(localStorage.getItem(BEST_KEY) || '0', 10);
+    return isFinite(v) && v > 0 ? v : 0;
+  } catch (e) { return 0; }
+}
+function saveBest() {
+  try { localStorage.setItem(BEST_KEY, String(best)); } catch (e) { /* storage blocked: ignore */ }
+}
+
+/* ---------- 3. WORLD GENERATION ---------- */
+function makePlanet(id, x, y, r) {
+  return {
+    id, x, y, r,
+    hue: rand(0, 360),
+    dir: id % 2 ? 1 : -1,               // alternating orbit direction (stored per planet)
+    orbitR: r + 28,
+    w: 2.2 / Math.sqrt(r / 30),         // angular speed (rad/s)
+    gm: G_BASE * (r / 30) * (r / 30),   // G*m for gravity
+    drift: false, vx: 0,
+    minX: r + 10, maxX: LW - r - 10
+  };
+}
+
+// Difficulty curve: changes every 3 deliveries ("stage").
+function diff() {
+  const stage = Math.floor(deliveries / 3);
+  const bonus = Math.min(60, stage * 10);
+  return {
+    gapMin: Math.min(300, 140 + bonus),
+    gapMax: Math.min(300, 240 + bonus),
+    drain: Math.min(5.5, 2.5 + 0.3 * stage),
+    asteroids: score >= ASTEROID_SCORE ? Math.min(4, 1 + stage) : 0,
+    driftChance: 0.2 + 0.2 * Math.min(1, deliveries / 15)
+  };
+}
+
+function spawnPlanetAfter(prev) {
+  const df = diff();
+  const id = planets.length;
+  const recent = planets.slice(-4);
+  let x = 240, y = prev.y - 200, r = 30;
+  for (let tries = 0; tries < 40; tries++) {
+    r = rand(18, 44);
+    y = prev.y - rand(df.gapMin, df.gapMax);
+    x = rand(60, 420);
+    if (recent.every(q => Math.hypot(q.x - x, q.y - y) >= q.r + r + 90)) break;
+  }
+  const p = makePlanet(id, x, y, r);
+  if (Math.random() < df.driftChance) {
+    p.drift = true;
+    p.vx = Math.random() < 0.5 ? -20 : 20;
+  }
+  planets.push(p);
+
+  // Floating stars in the gap between this planet and the previous one.
+  if (Math.random() < 0.8) {
+    const n = randInt(1, 2);
+    for (let i = 0; i < n; i++) {
+      const t = rand(0.25, 0.75);
+      const sx = prev.x + (p.x - prev.x) * t + rand(-70, 70);
+      const sy = prev.y + (p.y - prev.y) * t + rand(-20, 20);
+      if (Math.hypot(sx - p.x, sy - p.y) > p.r + 18 && Math.hypot(sx - prev.x, sy - prev.y) > prev.r + 18) {
+        stars.push({ x: sx, y: sy, taken: false, ph: rand(0, TAU) });
+      }
+    }
+  }
+  return p;
+}
+
+function planetAt(i) {
+  while (planets.length <= i) spawnPlanetAfter(planets[planets.length - 1]);
+  return planets[i];
+}
+
+function ensureWorld() {
+  while (planets[planets.length - 1].y > camY - 1100) spawnPlanetAfter(planets[planets.length - 1]);
+}
+
+function spawnAsteroid() {
+  const r = rand(10, 16);
+  for (let i = 0; i < 6; i++) {
+    const x = rand(r, LW - r), y = camY + rand(60, 300);
+    const clearOfPlanets = planets.every(p => Math.hypot(p.x - x, p.y - y) >= p.r + r + 50);
+    const clearOfDrone = Math.hypot(x - drone.x, y - drone.y) > 130;
+    if (clearOfPlanets && clearOfDrone) {
+      asteroids.push({
+        x, y, r,
+        vx: (Math.random() < 0.5 ? -1 : 1) * rand(25, 45),
+        rot: rand(0, TAU), spin: rand(-1, 1), seed: Math.random()
+      });
+      return;
+    }
+  }
+}
+
+function updateAsteroids(dt, df) {
+  for (const a of asteroids) {
+    a.x += a.vx * dt;
+    a.rot += a.spin * dt;
+    if (a.x < a.r) { a.x = a.r; a.vx = Math.abs(a.vx); }
+    else if (a.x > LW - a.r) { a.x = LW - a.r; a.vx = -Math.abs(a.vx); }
+  }
+  asteroids = asteroids.filter(a => scrY(a.y) < LH + 120);
+  if (df.asteroids > 0 && stepCount % 30 === 0) {
+    const live = asteroids.reduce((n, a) => n + (scrY(a.y) >= 0 && scrY(a.y) <= LH ? 1 : 0), 0);
+    if (live < df.asteroids) spawnAsteroid();
+  }
+}
+
+/* ---------- 4. PHYSICS ---------- */
+// Gravity acceleration at (x, y) from every planet whose well (r * WELL_K) contains it.
+// Shared by real flight and the trajectory preview so both integrate identically.
+// The planet just departed (skip) exerts no gravity until the drone has left its well once.
+const _grav = { ax: 0, ay: 0 };
+function gravityAt(x, y, skip) {
+  let ax = 0, ay = 0;
+  for (const p of planets) {
+    if (p === skip) continue;
+    const dx = p.x - x, dy = p.y - y;
+    const d2 = dx * dx + dy * dy;
+    const well = p.r * WELL_K;
+    if (d2 > 1 && d2 < well * well) {
+      const dd = Math.sqrt(d2);
+      const a = p.gm / d2;
+      ax += dx / dd * a;
+      ay += dy / dd * a;
+    }
+  }
+  _grav.ax = ax;
+  _grav.ay = ay;
+  return _grav;
+}
+
+// Velocity of the drone if released right now (tangent to its orbit + planet drift).
+function releaseVelocity() {
+  const d = drone, p = d.planet;
+  const sp = p.w * p.orbitR;
+  return {
+    vx: d.dir * sp * -Math.sin(d.angle) + p.vx,
+    vy: d.dir * sp * Math.cos(d.angle)
+  };
+}
+
+function updateCamera(dt) {
+  // Keep the drone at ~65% screen height, but never scroll down.
+  const want = drone.y - CAM_LEAD;
+  const next = camY + (want - camY) * (1 - Math.exp(-dt * 3));
+  camY = Math.min(camY, next);
+}
+
+/* ---------- 5. RULES ---------- */
+function startGame() {
+  resetRun();
+  state = 'playing';
+}
+
+function resetRun() {
+  score = 0; combo = 1; lives = LIVES_START; fuel = FUEL_START;
+  deliveries = 0; interCaptures = 0;
+  deaths = []; simTime = 0; captures = 0; highestId = 0; overReason = null;
+  misses = { capture: 0, respawn: 0, belowScreen: 0 };
+  planets = []; stars = []; asteroids = []; particles = []; texts = []; rings = [];
+  shake.t = 0; shake.mag = 0;
+  const start = makePlanet(0, START.x, START.y, START.r);
+  planets.push(start);
+  lastPlanet = start;
+  camY = start.y - CAM_LEAD;
+  drone = {
+    x: start.x, y: start.y - start.orbitR, vx: 0, vy: 0,
+    mode: 'orbit', planet: start, angle: -Math.PI / 2, dir: start.dir,
+    trail: [], inv: 0, justLeft: null, flightT: 0
+  };
+  ensureWorld();
+  target = planetAt(randInt(2, 4));
+  thrustBlocked = true;
+  newBest = false;
+  overT = 0;
+}
+
+function releaseDrone() {
+  const d = drone;
+  const v = releaseVelocity();
+  d.vx = v.vx; d.vy = v.vy;
+  d.mode = 'flight';
+  d.justLeft = d.planet;
+  d.departed = d.planet;
+  d.flightT = 0;
+  lastPlanet = d.planet;
+  thrustBlocked = true;
+  tone(300, 600, 0.12, 'sine', 0.1, 0, true);     // whoop
+  burst(d.x, d.y, C.drone, 6, 50);
+}
+
+function capture(p) {
+  const d = drone;
+  const dx = d.x - p.x, dy = d.y - p.y;
+  const cross = dx * d.vy - dy * d.vx;            // sign of travel around the planet
+  d.dir = cross >= 0 ? 1 : -1;
+  d.angle = Math.atan2(dy, dx);
+  d.mode = 'orbit';
+  d.planet = p;
+  d.justLeft = null;
+  d.departed = null;
+  d.flightT = 0;
+  lastPlanet = p;
+  captures++;
+  ring(p.x, p.y, p.r, p.orbitR + 14, C.drone, 0.45);
+  tone(880, 880, 0.22, 'triangle', 0.12);         // bell
+  if (p.id > highestId) {                         // first time this run reaching this high
+    highestId = p.id;
+    fuel = Math.min(FUEL_MAX, fuel + 6);
+    texts.push({ x: p.x, y: p.y - p.r - 30, t: 0, life: 0.9, text: '+fuel', color: C.drone });
+  }
+  if (p === target) deliver(p);
+  else {
+    interCaptures++;
+    if (p.id > target.id) overshootMiss('capture', p);   // captured past the target
+  }
+}
+
+// Overshoot: the drone is past its target. Combo resets and a new target is chosen above `from`.
+function overshootMiss(cause, from) {
+  misses[cause]++;
+  combo = 1;
+  target = planetAt(from.id + randInt(2, 4));
+  texts.push({ x: from.x, y: from.y - from.r - 16, t: 0, life: 1.0, text: 'MISS', color: C.danger });
+}
+
+function deliver(p) {
+  const clean = interCaptures <= 2;
+  const mult = combo;
+  const pts = 100 * mult;
+  score += pts;
+  fuel = Math.min(FUEL_MAX, fuel + FUEL_PER_DELIVERY);
+  deliveries++;
+  combo = clean ? Math.min(5, combo + 1) : 1;
+  interCaptures = 0;
+  target = planetAt(p.id + randInt(2, 4));
+  burst(p.x, p.y, C.target, 36, 240);
+  ring(p.x, p.y, p.r, p.r + 80, C.target, 0.7);
+  texts.push({ x: p.x, y: p.y - p.r - 16, t: 0, life: 1.1, text: `+${pts} ×${mult}`, color: C.target });
+  // arpeggio
+  tone(523, 523, 0.14, 'triangle', 0.14, 0);
+  tone(659, 659, 0.14, 'triangle', 0.14, 0.09);
+  tone(784, 784, 0.24, 'triangle', 0.14, 0.18);
+}
+
+// Planet to respawn on: the last planet if usable, else the nearest usable planet.
+// Never the target. Never moves the camera down.
+function respawnPlanet() {
+  if (lastPlanet !== target && scrY(lastPlanet.y) <= 640) return lastPlanet;
+  const cands = [];
+  for (let i = lastPlanet.id; i < planets.length; i++) cands.push(planets[i]);       // higher planets first
+  for (let i = lastPlanet.id - 1; i >= 0; i--) cands.push(planets[i]);               // then lower ones
+  const v = cands.filter(q => q !== target);
+  // 1) comfortably on screen
+  let q = v.find(q => scrY(q.y) >= 140 && scrY(q.y) <= 600);
+  if (q) return q;
+  // 2) at least partly on screen
+  q = v.find(q => scrY(q.y) + q.r > 0 && scrY(q.y) - q.r < LH);
+  if (q) return q;
+  // 3) the highest planet in view or above (the camera is not moved)
+  return v.reduce((best, c) => (scrY(c.y) < scrY(best.y) ? c : best), v[0]);
+}
+
+function respawn() {
+  const p = respawnPlanet();
+  if (p.id > target.id) overshootMiss('respawn', p);
+  const d = drone;
+  d.mode = 'orbit';
+  d.planet = p;
+  d.dir = p.dir;
+  d.angle = target ? Math.atan2(target.y - p.y, target.x - p.x) : -Math.PI / 2;
+  d.x = p.x + Math.cos(d.angle) * p.orbitR;
+  d.y = p.y + Math.sin(d.angle) * p.orbitR;
+  d.inv = INVULN;
+  d.justLeft = null;
+  d.departed = null;
+  d.flightT = 0;
+  d.trail = [];
+  lastPlanet = p;
+  thrustBlocked = true;
+  ring(p.x, p.y, p.r, p.orbitR + 10, C.drone, 0.4);
+}
+
+function loseLife(cause) {
+  lives -= 1;
+  deaths.push(cause);
+  if (cause !== 'offscreen') {
+    shake.t = SHAKE_DUR; shake.mag = 8;
+    burst(drone.x, drone.y, C.danger, 26, 180);
+    noise(0.3, 0.3);
+    tone(260, 70, 0.3, 'sawtooth', 0.06, 0, true);
+  } else {
+    noise(0.25, 0.12);
+    tone(500, 150, 0.3, 'triangle', 0.1, 0, true);
+  }
+  if (lives <= 0) { lives = 0; gameOver('lives'); return; }
+  respawn();
+}
+
+function gameOver(reason) {
+  state = 'over';
+  overReason = reason;
+  overT = 0;
+  newBest = score > best;
+  if (newBest) { best = score; saveBest(); }
+  burst(drone.x, drone.y, C.danger, 30, 200);
+  tone(330, 110, 0.5, 'sawtooth', 0.08, 0, true);
+}
+
+function togglePause() {
+  if (state === 'playing') state = 'paused';
+  else if (state === 'paused') {
+    state = 'playing';
+    thrustBlocked = true;                          // a held input must not thrust on resume
+  }
+}
+
+// Returns 'surface', 'asteroid' or null.
+function hitsDanger(d) {
+  for (const p of planets) {
+    if (Math.hypot(p.x - d.x, p.y - d.y) < p.r + CRASH_PAD) return 'surface';
+  }
+  for (const a of asteroids) {
+    if (Math.hypot(a.x - d.x, a.y - d.y) < a.r + CRASH_PAD) return 'asteroid';
+  }
+  return null;
+}
+
+function updateWorld(dt) {
+  const df = diff();
+  stepCount++;
+
+  // Drifting planets bounce between the screen sides.
+  for (const p of planets) {
+    if (!p.drift) continue;
+    p.x += p.vx * dt;
+    if (p.x < p.minX) { p.x = p.minX; p.vx = Math.abs(p.vx); }
+    else if (p.x > p.maxX) { p.x = p.maxX; p.vx = -Math.abs(p.vx); }
+  }
+  ensureWorld();
+  updateAsteroids(dt, df);
+
+  const d = drone;
+  if (d.inv > 0) d.inv = Math.max(0, d.inv - dt);
+
+  // --- motion ---
+  let thrusting = false;
+  if (d.mode === 'orbit') {
+    const p = d.planet;
+    d.angle += d.dir * p.w * dt;
+    d.x = p.x + Math.cos(d.angle) * p.orbitR;
+    d.y = p.y + Math.sin(d.angle) * p.orbitR;
+    const v = releaseVelocity();
+    d.vx = v.vx; d.vy = v.vy;
+    if (target && scrY(target.y) > LH) overshootMiss('belowScreen', p);   // target fell below the view
+  } else {
+    d.flightT += dt;
+    const g = gravityAt(d.x, d.y, d.departed);
+    let ax = g.ax, ay = g.ay;
+    thrusting = (holdSpace || holdUp || holdPointer) && !thrustBlocked && fuel > 0 && !!target;
+    if (thrusting) {
+      // Thrust points from the drone toward the target planet.
+      const tx = target.x - d.x, ty = target.y - d.y, td = Math.hypot(tx, ty);
+      if (td > 1e-3) { ax += tx / td * THRUST_A; ay += ty / td * THRUST_A; }
+    }
+    d.vx += ax * dt;
+    d.vy += ay * dt;
+    const sp = Math.hypot(d.vx, d.vy);
+    if (sp > MAX_SPEED) { d.vx *= MAX_SPEED / sp; d.vy *= MAX_SPEED / sp; }
+    d.x += d.vx * dt;
+    d.y += d.vy * dt;
+    if (d.departed && Math.hypot(d.departed.x - d.x, d.departed.y - d.y) > d.departed.r * WELL_K) d.departed = null;
+  }
+  simTime += dt;
+  lastThrusting = thrusting;
+  d.trail.push({ x: d.x, y: d.y });
+  if (d.trail.length > 20) d.trail.shift();
+
+  // --- the clock ---
+  fuel -= (df.drain + (thrusting ? THRUST_FUEL : 0)) * dt;
+  if (fuel <= 0) { fuel = 0; gameOver('fuel'); return; }
+
+  updateCamera(dt);
+
+  // --- stars ---
+  for (const s of stars) {
+    if (s.taken || Math.hypot(s.x - d.x, s.y - d.y) >= 11) continue;
+    s.taken = true;
+    score += 10;
+    burst(s.x, s.y, '#fff3b0', 8, 90);
+    tone(1320, 1320, 0.06, 'sine', 0.06);
+  }
+  if (stepCount % 120 === 0) stars = stars.filter(s => scrY(s.y) < LH + 150);
+
+  if (d.mode !== 'flight') return;
+
+  // --- crashes ---
+  if (d.inv <= 0) {
+    const hit = hitsDanger(d);
+    if (hit) { loseLife(hit); return; }
+  }
+
+  // --- captures (planet orbit bands) ---
+  for (const p of planets) {
+    if (p === d.justLeft && d.flightT < RELEASE_GRACE) continue;
+    const dd = Math.hypot(p.x - d.x, p.y - d.y);
+    if (Math.abs(dd - p.orbitR) <= CAPTURE_BAND) { capture(p); break; }
+  }
+  if (d.mode !== 'flight') return;
+
+  // --- lost off the sides or bottom ---
+  if (d.x < -LOST_PAD || d.x > LW + LOST_PAD || scrY(d.y) > LH + LOST_PAD) {
+    loseLife('offscreen');
+  }
+}
+
+function updateFX(dt) {
+  for (const p of particles) {
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    const drag = Math.max(0, 1 - 2 * dt);
+    p.vx *= drag; p.vy *= drag;
+    p.life -= dt;
+  }
+  particles = particles.filter(p => p.life > 0);
+  for (const t of texts) { t.t += dt; t.y -= 30 * dt; }
+  texts = texts.filter(t => t.t < t.life);
+  for (const r of rings) r.t += dt;
+  rings = rings.filter(r => r.t < r.life);
+  if (shake.t > 0) shake.t = Math.max(0, shake.t - dt);
+}
+
+function step(dt) {
+  elapsed += dt;
+  if (state === 'playing') updateWorld(dt);
+  else if (state === 'over') overT += dt;
+  else if (state === 'title') titleAngle += dt * 1.9;
+  updateFX(dt);
+}
+
+/* ---------- 6. AUDIO (WebAudio, created on first user input) ---------- */
+function unlockAudio() {
+  try {
+    if (!audio) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) audio = new AC();
+    }
+    if (audio && audio.state === 'suspended') audio.resume().catch(() => {});
+  } catch (e) { audio = null; }
+}
+
+function tone(f0, f1, dur, type = 'sine', vol = 0.12, delay = 0, linear = false) {
+  if (!audio || audio.state !== 'running') return;
+  try {
+    const t0 = audio.currentTime + delay;
+    const o = audio.createOscillator();
+    const g = audio.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(f0, t0);
+    if (f1 !== f0) {
+      if (linear) o.frequency.linearRampToValueAtTime(f1, t0 + dur);
+      else o.frequency.exponentialRampToValueAtTime(f1, t0 + dur);
+    }
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(vol, t0 + 0.012);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    o.connect(g);
+    g.connect(audio.destination);
+    o.start(t0);
+    o.stop(t0 + dur + 0.05);
+  } catch (e) { /* audio is optional */ }
+}
+
+function noise(dur, vol) {
+  if (!audio || audio.state !== 'running') return;
+  try {
+    const sr = audio.sampleRate;
+    const len = Math.floor(sr * dur);
+    const buf = audio.createBuffer(1, len, sr);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < len; i++) data[i] = (Math.random() * 2 - 1) * (1 - i / len);
+    const src = audio.createBufferSource();
+    const g = audio.createGain();
+    src.buffer = buf;
+    g.gain.value = vol;
+    src.connect(g);
+    g.connect(audio.destination);
+    src.start();
+  } catch (e) { /* audio is optional */ }
+}
+
+/* ---------- 7. INPUT ---------- */
+const holdAny = () => holdSpace || holdUp || holdPointer;
+
+// Actions that depend on state: start, retry, resume, or release from orbit.
+function pressAction() {
+  if (state === 'title') { startGame(); return; }
+  if (state === 'over') { if (overT >= GUARD_OVER) startGame(); return; }
+  if (state === 'paused') { togglePause(); return; }
+  if (state === 'playing' && drone.mode === 'orbit') releaseDrone();
+}
+
+function toLogical(e) {
+  return { x: (e.clientX - layout.ox) / layout.s, y: (e.clientY - layout.oy) / layout.s };
+}
+function inRect(p, r) {
+  return p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h;
+}
+
+window.addEventListener('keydown', e => {
+  const k = e.code;
+  if (k === 'Space' || k === 'ArrowUp' || k === 'Enter' || k === 'NumpadEnter' || k === 'KeyP' || k === 'Escape') {
+    e.preventDefault();
+  }
+  unlockAudio();
+  if (k === 'Space') {
+    holdSpace = true;
+    if (!e.repeat) pressAction();
+  } else if (k === 'Enter' || k === 'NumpadEnter') {
+    if (!e.repeat) pressAction();
+  } else if (k === 'ArrowUp') {
+    holdUp = true;
+    if (state === 'playing' && drone.mode === 'orbit') thrustBlocked = true;
+  } else if (k === 'KeyP' || k === 'Escape') {
+    if (!e.repeat && (state === 'playing' || state === 'paused')) togglePause();
+  }
+});
+
+window.addEventListener('keyup', e => {
+  if (e.code === 'Space') holdSpace = false;
+  else if (e.code === 'ArrowUp') holdUp = false;
+  if (!holdAny()) thrustBlocked = false;
+});
+
+window.addEventListener('pointerdown', e => {
+  if (e.button !== undefined && e.button > 0) return;
+  e.preventDefault();
+  unlockAudio();
+  const p = toLogical(e);
+  if ((state === 'playing' || state === 'paused') && inRect(p, PAUSE_BTN)) {
+    togglePause();
+    return;
+  }
+  holdPointer = true;
+  pressAction();
+});
+
+const pointerEnd = () => {
+  holdPointer = false;
+  if (!holdAny()) thrustBlocked = false;
+};
+window.addEventListener('pointerup', pointerEnd);
+window.addEventListener('pointercancel', pointerEnd);
+window.addEventListener('contextmenu', e => e.preventDefault());
+
+window.addEventListener('blur', () => {
+  holdSpace = holdUp = holdPointer = false;
+  thrustBlocked = false;
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    holdSpace = holdUp = holdPointer = false;
+    thrustBlocked = false;
+    if (state === 'playing') state = 'paused';
+  }
+});
+
+/* ---------- 8. RENDERING ---------- */
+function resize() {
+  const W = window.innerWidth, H = window.innerHeight;
+  const dpr = Math.min(window.devicePixelRatio || 1, 3);
+  cv.style.width = W + 'px';
+  cv.style.height = H + 'px';
+  cv.width = Math.max(1, Math.round(W * dpr));
+  cv.height = Math.max(1, Math.round(H * dpr));
+  const s = Math.min(W / LW, H / LH);
+  layout.dpr = dpr;
+  layout.s = s;
+  layout.ox = (W - LW * s) / 2;
+  layout.oy = (H - LH * s) / 2;
+}
+
+function rr(x, y, w, h, r) {
+  if (w < 1 || h < 1) return;
+  r = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+}
+
+function text(str, x, y, font, color, align = 'center', glow = 0) {
+  ctx.save();
+  ctx.font = font;
+  ctx.fillStyle = color;
+  ctx.textAlign = align;
+  ctx.textBaseline = 'middle';
+  if (glow) { ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  ctx.fillText(str, x, y);
+  ctx.restore();
+}
+
+function burst(x, y, color, n, speed) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * TAU;
+    const s = rand(0.3, 1) * speed;
+    const life = rand(0.4, 0.9);
+    particles.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life, max: life, color, size: rand(1.5, 3.2) });
+  }
+}
+
+function ring(x, y, r0, r1, color, life) {
+  rings.push({ x, y, r0, r1, color, life, t: 0 });
+}
+
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, LH);
+  g.addColorStop(0, C.top);
+  g.addColorStop(1, C.bot);
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, LW, LH);
+  // Two parallax star layers, wrapping vertically.
+  for (const layer of bgStars) {
+    for (const s of layer.pts) {
+      const y = mod(s.y - camY * layer.f, LH);
+      ctx.fillStyle = `rgba(255,255,255,${layer.a * (0.6 + 0.4 * Math.sin(elapsed * 2 + s.tw))})`;
+      ctx.beginPath();
+      ctx.arc(s.x, y, s.r, 0, TAU);
+      ctx.fill();
+    }
+  }
+}
+
+function drawPlanetBody(x, y, r, hue) {
+  const gl = ctx.createRadialGradient(x, y, r * 0.8, x, y, r * 2.4);
+  gl.addColorStop(0, `hsla(${hue},80%,60%,0.3)`);
+  gl.addColorStop(1, `hsla(${hue},80%,60%,0)`);
+  ctx.fillStyle = gl;
+  ctx.beginPath();
+  ctx.arc(x, y, r * 2.4, 0, TAU);
+  ctx.fill();
+  const bg = ctx.createRadialGradient(x - r * 0.35, y - r * 0.35, r * 0.15, x, y, r);
+  bg.addColorStop(0, `hsl(${hue},70%,80%)`);
+  bg.addColorStop(0.6, `hsl(${hue},60%,50%)`);
+  bg.addColorStop(1, `hsl(${hue},55%,25%)`);
+  ctx.fillStyle = bg;
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, TAU);
+  ctx.fill();
+}
+
+function drawPlanet(p, isTarget) {
+  const sy = scrY(p.y);
+  ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.arc(p.x, sy, p.orbitR, 0, TAU);
+  ctx.stroke();
+  drawPlanetBody(p.x, sy, p.r, p.hue);
+  if (isTarget) {
+    const pulse = 0.5 + 0.5 * Math.sin(elapsed * 5);
+    ctx.save();
+    ctx.shadowColor = C.target;
+    ctx.shadowBlur = 14;
+    ctx.strokeStyle = C.target;
+    ctx.lineWidth = 3;
+    ctx.globalAlpha = 0.55 + 0.45 * pulse;
+    ctx.beginPath();
+    ctx.arc(p.x, sy, p.r + 9 + pulse * 4, 0, TAU);
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+function drawStar(s) {
+  const sy = scrY(s.y);
+  const tw = 0.7 + 0.3 * Math.sin(elapsed * 4 + s.ph);
+  ctx.fillStyle = `rgba(255,243,176,${tw})`;
+  ctx.beginPath();
+  ctx.arc(s.x, sy, 5, 0, TAU);
+  ctx.fill();
+}
+
+function drawAsteroid(a) {
+  ctx.save();
+  ctx.translate(a.x, scrY(a.y));
+  ctx.rotate(a.rot);
+  ctx.fillStyle = '#2a2440';
+  ctx.strokeStyle = C.danger;
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  for (let i = 0; i < 7; i++) {
+    const ang = i / 7 * TAU;
+    const rr2 = a.r * (0.75 + 0.25 * Math.sin(i * 2.3 + a.seed * 10));
+    const x = Math.cos(ang) * rr2, y = Math.sin(ang) * rr2;
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+  ctx.restore();
+}
+
+// Predicted path if released now: simulated with gravity, using the same
+// integrator and step as real flight, for PRED_T seconds. Stops at a capture
+// or a crash. Thrust is not simulated (it is only applied when held).
+// duration: seconds to simulate; every: keep one point per this many steps.
+// Returns { pts, end } where end is the planet that captured the path (or null).
+function simulatePath(duration = PRED_T, every = 8) {
+  const v = releaseVelocity();
+  const justLeft = drone.planet;
+  let departed = justLeft;                       // same rule as real flight
+  let x = drone.x, y = drone.y, vx = v.vx, vy = v.vy;
+  const pts = [];
+  let end = null;
+  const steps = Math.round(duration / STEP);
+  for (let i = 1; i <= steps; i++) {
+    const t = i * STEP;
+    const g = gravityAt(x, y, departed);
+    vx += g.ax * STEP;
+    vy += g.ay * STEP;
+    const sp = Math.hypot(vx, vy);
+    if (sp > MAX_SPEED) { vx *= MAX_SPEED / sp; vy *= MAX_SPEED / sp; }
+    x += vx * STEP;
+    y += vy * STEP;
+    if (departed && Math.hypot(departed.x - x, departed.y - y) > departed.r * WELL_K) departed = null;
+    let stop = false;
+    for (const p of planets) {
+      const dd = Math.hypot(p.x - x, p.y - y);
+      if (dd < p.r + CRASH_PAD) { stop = true; break; }
+      if (p === justLeft && t < RELEASE_GRACE) continue;
+      if (Math.abs(dd - p.orbitR) <= CAPTURE_BAND) { end = p; stop = true; break; }
+    }
+    if (stop) break;
+    if (i % every === 0) pts.push({ x, y });
+  }
+  return { pts, end };
+}
+
+// Dotted preview of the simulated path.
+// The dots fade slowly over the 1.8 s; a bright ring marks the planet it would capture
+// (gold if that is the target).
+function drawPrediction() {
+  const { pts, end } = simulatePath();
+  ctx.fillStyle = C.drone;
+  const n = pts.length;
+  for (let i = 0; i < n; i++) {
+    ctx.globalAlpha = 0.85 * (1 - 0.85 * (i + 1) / (n + 1));
+    ctx.beginPath();
+    ctx.arc(pts[i].x, scrY(pts[i].y), 1.8, 0, TAU);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  if (end) {
+    const col = end === target ? C.target : C.drone;
+    const pulse = 0.6 + 0.4 * Math.sin(elapsed * 8);
+    ctx.save();
+    ctx.shadowColor = col;
+    ctx.shadowBlur = 12;
+    ctx.strokeStyle = col;
+    ctx.lineWidth = 3;
+    ctx.globalAlpha = pulse;
+    ctx.beginPath();
+    ctx.arc(end.x, scrY(end.y), end.r + 8, 0, TAU);
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+function drawTrail() {
+  const tr = drone.trail;
+  const n = tr.length;
+  for (let i = 0; i < n; i++) {
+    const k = (i + 1) / n;
+    ctx.fillStyle = `rgba(124,247,255,${0.45 * k})`;
+    ctx.beginPath();
+    ctx.arc(tr[i].x, scrY(tr[i].y), 1 + 2.5 * k, 0, TAU);
+    ctx.fill();
+  }
+}
+
+function drawShip(x, sy, heading, thrusting) {
+  ctx.save();
+  ctx.translate(x, sy);
+  ctx.rotate(heading);
+  if (thrusting) {
+    const len = 9 + 3 * Math.sin(elapsed * 60);
+    ctx.fillStyle = '#ffb347';
+    ctx.beginPath();
+    ctx.moveTo(-4, -2.5);
+    ctx.lineTo(-4 - len, 0);
+    ctx.lineTo(-4, 2.5);
+    ctx.closePath();
+    ctx.fill();
+  }
+  ctx.shadowColor = C.drone;
+  ctx.shadowBlur = 12;
+  ctx.fillStyle = C.drone;
+  ctx.beginPath();
+  ctx.moveTo(9, 0);
+  ctx.lineTo(-6, -6);
+  ctx.lineTo(-3, 0);
+  ctx.lineTo(-6, 6);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawDrone() {
+  const d = drone;
+  if (d.inv > 0 && Math.floor(elapsed * 12) % 2 === 0) return;   // blink while invulnerable
+  drawShip(d.x, scrY(d.y), Math.atan2(d.vy, d.vx), lastThrusting);
+}
+
+// Off-screen target: arrow on the inset border, pointing from screen centre toward the target.
+function drawTargetArrow() {
+  if (!target) return;
+  const tx = target.x, ty = scrY(target.y);
+  if (tx >= 30 && tx <= LW - 30 && ty >= 92 && ty <= LH - 30) return;  // inside the play area: ring is visible
+  const ox = LW / 2, oy = LH / 2;
+  const vx = tx - ox, vy = ty - oy;
+  if (Math.hypot(vx, vy) < 1) return;
+  const m = 30, top = 92, bot = LH - 30;
+  let s = Infinity;
+  if (vx > 0) s = Math.min(s, (LW - m - ox) / vx);
+  else if (vx < 0) s = Math.min(s, (m - ox) / vx);
+  if (vy > 0) s = Math.min(s, (bot - oy) / vy);
+  else if (vy < 0) s = Math.min(s, (top - oy) / vy);
+  if (!isFinite(s) || s <= 0) return;
+  const ax = ox + vx * s, ay = oy + vy * s;
+  ctx.save();
+  ctx.translate(ax, ay);
+  ctx.rotate(Math.atan2(vy, vx));
+  ctx.shadowColor = C.target;
+  ctx.shadowBlur = 10;
+  ctx.fillStyle = C.target;
+  ctx.beginPath();
+  ctx.moveTo(10, 0);
+  ctx.lineTo(-7, -7);
+  ctx.lineTo(-7, 7);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawHUD() {
+  // Fuel bar (top, full width). Red and pulsing when low.
+  const bx = 12, by = 12, bw = PAUSE_BTN.x - 22, bh = 12;
+  ctx.fillStyle = 'rgba(255,255,255,0.12)';
+  rr(bx, by, bw, bh, 6);
+  ctx.fill();
+  const f = clamp(fuel / FUEL_MAX, 0, 1);
+  const low = fuel < FUEL_LOW;
+  ctx.globalAlpha = low ? 0.55 + 0.45 * Math.sin(elapsed * 12) : 1;
+  ctx.fillStyle = low ? C.danger : C.drone;
+  rr(bx, by, bw * f, bh, 6);
+  ctx.fill();
+  ctx.globalAlpha = 1;
+
+  // Score and combo (top-left).
+  text(String(score), 14, 62, `bold 26px ${FONT}`, C.text, 'left');
+  text(`COMBO ×${combo}`, 14, 86, `600 14px ${FONT}`, C.target, 'left');
+
+  // Lives as drone icons (top-right).
+  for (let i = 0; i < LIVES_START; i++) {
+    const x = LW - 20 - i * 20, y = 64;
+    ctx.fillStyle = i < lives ? C.drone : 'rgba(255,255,255,0.18)';
+    ctx.beginPath();
+    ctx.moveTo(x, y - 7);
+    ctx.lineTo(x + 6, y + 5);
+    ctx.lineTo(x - 6, y + 5);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  // Pause button.
+  const P = PAUSE_BTN;
+  ctx.fillStyle = 'rgba(255,255,255,0.12)';
+  rr(P.x, P.y, P.w, P.h, 8);
+  ctx.fill();
+  ctx.fillStyle = C.text;
+  ctx.fillRect(P.x + 19, P.y + 9, 4, 14);
+  ctx.fillRect(P.x + 28, P.y + 9, 4, 14);
+}
+
+function drawWorld() {
+  for (const p of planets) {
+    const sy = scrY(p.y);
+    if (sy < -150 || sy > LH + 150) continue;
+    drawPlanet(p, p === target);
+  }
+  for (const s of stars) {
+    if (s.taken) continue;
+    const sy = scrY(s.y);
+    if (sy < -20 || sy > LH + 20) continue;
+    drawStar(s);
+  }
+  for (const a of asteroids) drawAsteroid(a);
+  if (state === 'playing' && drone.mode === 'orbit') drawPrediction();
+  drawTrail();
+  drawDrone();
+
+  for (const r of rings) {
+    const k = r.t / r.life;
+    ctx.globalAlpha = 1 - k;
+    ctx.strokeStyle = r.color;
+    ctx.lineWidth = 3 * (1 - k) + 0.5;
+    ctx.beginPath();
+    ctx.arc(r.x, scrY(r.y), r.r0 + (r.r1 - r.r0) * easeOut(k), 0, TAU);
+    ctx.stroke();
+  }
+  for (const p of particles) {
+    ctx.globalAlpha = clamp(p.life / p.max, 0, 1);
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.arc(p.x, scrY(p.y), p.size, 0, TAU);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  for (const t of texts) {
+    ctx.globalAlpha = clamp(1 - t.t / t.life, 0, 1);
+    text(t.text, t.x, scrY(t.y), `bold 18px ${FONT}`, t.color);
+  }
+  ctx.globalAlpha = 1;
+  drawTargetArrow();
+  drawHUD();
+}
+
+function drawTitle() {
+  const t = elapsed;
+  text('ORBIT', LW / 2, 150, `900 56px ${FONT}`, C.drone, 'center', 18);
+  text('COURIER', LW / 2, 214, `900 46px ${FONT}`, C.text, 'center', 0);
+  text('Slingshot parcels between planets. Hit the gold ring.', LW / 2, 252, `500 15px ${FONT}`, 'rgba(244,246,255,0.75)');
+
+  // Demo: delivery planet with a pulsing gold ring.
+  const tp = { x: 350, y: 362, r: 26, hue: 36 };
+  drawPlanetBody(tp.x, tp.y, tp.r, tp.hue);
+  ctx.save();
+  ctx.shadowColor = C.target;
+  ctx.shadowBlur = 14;
+  ctx.strokeStyle = C.target;
+  ctx.lineWidth = 3;
+  ctx.globalAlpha = 0.6 + 0.4 * Math.sin(t * 5);
+  ctx.beginPath();
+  ctx.arc(tp.x, tp.y, tp.r + 9, 0, TAU);
+  ctx.stroke();
+  ctx.restore();
+
+  // Demo: launch planet with an orbiting drone.
+  const lp = { x: 150, y: 458, r: 34, hue: 205 };
+  const oR = lp.r + 28;
+  drawPlanetBody(lp.x, lp.y, lp.r, lp.hue);
+  ctx.strokeStyle = 'rgba(255,255,255,0.1)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.arc(lp.x, lp.y, oR, 0, TAU);
+  ctx.stroke();
+  const a = titleAngle;
+  drawShip(lp.x + Math.cos(a) * oR, lp.y + Math.sin(a) * oR, a + Math.PI / 2, false);
+
+  // Controls panel.
+  ctx.fillStyle = 'rgba(255,255,255,0.06)';
+  rr(40, 530, 400, 150, 14);
+  ctx.fill();
+  const rows = [
+    ['Tap / Space / Enter', 'release from orbit'],
+    ['Hold Space / Up', 'micro-thrust in flight'],
+    ['P / Esc / top-right', 'pause'],
+    ['Gold ring', 'deliver the parcel here']
+  ];
+  rows.forEach((row, i) => {
+    const y = 562 + i * 30;
+    text(row[0], 60, y, `bold 13px ${FONT}`, C.drone, 'left');
+    text(row[1], 232, y, `500 13px ${FONT}`, C.text, 'left');
+  });
+
+  text(`BEST ${best}`, LW / 2, 712, `700 20px ${FONT}`, C.target);
+  const blink = 0.55 + 0.45 * Math.sin(t * 4);
+  text('Tap / Space to start', LW / 2, 752, `600 18px ${FONT}`, `rgba(255,255,255,${blink})`);
+}
+
+function drawPauseOverlay() {
+  ctx.fillStyle = 'rgba(6,8,24,0.62)';
+  ctx.fillRect(0, 0, LW, LH);
+  text('PAUSED', LW / 2, 360, `900 40px ${FONT}`, C.text, 'center', 10);
+  text('P / Esc or tap to resume', LW / 2, 404, `500 16px ${FONT}`, 'rgba(244,246,255,0.8)');
+}
+
+function drawOverOverlay() {
+  ctx.fillStyle = 'rgba(6,8,24,0.7)';
+  ctx.fillRect(0, 0, LW, LH);
+  text(overReason === 'fuel' ? 'OUT OF FUEL' : 'NO LIVES LEFT', LW / 2, 250, `900 42px ${FONT}`, C.danger, 'center', 14);
+  text(`SCORE ${score}`, LW / 2, 316, `800 30px ${FONT}`, C.text);
+  text(newBest ? 'NEW BEST!' : `BEST ${best}`, LW / 2, 360, `700 20px ${FONT}`,
+    newBest ? C.target : 'rgba(244,246,255,0.8)');
+  text(`${deliveries} deliver${deliveries === 1 ? 'y' : 'ies'}`, LW / 2, 400, `500 16px ${FONT}`, 'rgba(244,246,255,0.8)');
+  if (overT >= GUARD_OVER) {
+    text('Tap / Space to retry', LW / 2, 480, `600 18px ${FONT}`,
+      `rgba(255,255,255,${0.55 + 0.45 * Math.sin(elapsed * 4)})`);
+  }
+}
+
+function render() {
+  const { dpr, s, ox, oy } = layout;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, cv.width, cv.height);
+  ctx.setTransform(dpr * s, 0, 0, dpr * s, dpr * ox, dpr * oy);
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(0, 0, LW, LH);
+  ctx.clip();
+  if (shake.t > 0) {
+    const k = shake.t / SHAKE_DUR * shake.mag;
+    ctx.translate(rand(-k, k), rand(-k, k));
+  }
+  drawBackground();
+  if (state === 'title') {
+    drawTitle();
+  } else {
+    drawWorld();
+    if (state === 'paused') drawPauseOverlay();
+    if (state === 'over') drawOverOverlay();
+  }
+  ctx.restore();
+
+  game.state = state;
+  game.score = score;
+  game.lives = lives;
+  game.fuel = Math.round(fuel * 10) / 10;
+  game.deliveries = deliveries;
+  game.best = best;
+  game.time = simTime;
+  game.deaths = deaths;
+  game.captures = captures;
+  game.overReason = overReason;
+  game.misses = misses;
+}
+
+/* ---------- 9. MAIN LOOP ---------- */
+let acc = 0;
+let lastT = performance.now();
+
+function frame(now) {
+  let dt = (now - lastT) / 1000;
+  lastT = now;
+  if (!(dt >= 0)) dt = 0;
+  if (dt > 0.05) dt = 0.05;            // clamp so tab switches don't explode physics
+  if (state !== 'paused') acc += dt;
+  else acc = 0;
+  while (acc >= STEP) {
+    step(STEP);
+    acc -= STEP;
+  }
+  render();
+  requestAnimationFrame(frame);
+}
+
+function init() {
+  resize();
+  window.addEventListener('resize', resize);
+  bgStars = [
+    { f: 0.15, a: 0.5, pts: Array.from({ length: 70 }, () => ({ x: Math.random() * LW, y: Math.random() * LH, r: rand(0.5, 1.1), tw: Math.random() * TAU })) },
+    { f: 0.4, a: 0.85, pts: Array.from({ length: 35 }, () => ({ x: Math.random() * LW, y: Math.random() * LH, r: rand(0.9, 1.8), tw: Math.random() * TAU })) }
+  ];
+  resetRun();
+  state = 'title';
+  requestAnimationFrame(t => { lastT = t; frame(t); });
+}
+
+init();
+</script>
+</body>
+</html>
