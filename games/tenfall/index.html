@@ -1,0 +1,929 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Tenfall</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #14121f; overflow: hidden; }
+  canvas { display: block; position: fixed; left: 0; top: 0; touch-action: none; user-select: none; -webkit-user-select: none; }
+</style>
+</head>
+<body>
+<canvas id="game" aria-label="Tenfall"></canvas>
+<script>
+/* =====================================================================
+   TENFALL - numbered tiles drop into a 6x10 well. Any straight run of
+   2+ adjacent tiles (horizontal or vertical) summing to exactly 10
+   shatters; tiles above fall and can chain.
+   Sections: 1 pure rules | 2 config & state | 3 audio | 4 game flow |
+             5 layout | 6 input | 7 rendering | 8 main loop
+   ===================================================================== */
+(() => {
+'use strict';
+
+/* ---------- 1. PURE RULES (unit-tested; keep self-contained) ---------- */
+// @pure-start
+const COLS = 6, ROWS = 10, TARGET = 10, WILD_OFF = 10;
+// Grid is grid[x][y], y = 0 at the bottom. Cell codes:
+//   null = empty, 0 = rock (never summed), 1..9 = number tile, 11..19 = wild tile (value = code - 10)
+const keyOf = (x, y) => x * 10 + y;
+const unkey = k => [Math.floor(k / 10), k % 10];
+const valOf = c => (c === null || c === 0) ? 0 : (c > WILD_OFF ? c - WILD_OFF : c);
+const copyGrid = g => g.map(col => col.slice());
+const emptyGrid = () => Array.from({ length: COLS }, () => Array(ROWS).fill(null));
+
+// Every contiguous horizontal or vertical run of length >= 2 whose sum is exactly 10.
+// Overlapping runs are all reported. Returns [{ keys: [...] }].
+function findClears(g) {
+  const runs = [];
+  for (let y = 0; y < ROWS; y++) {
+    for (let x0 = 0; x0 < COLS; x0++) {
+      let sum = 0;
+      for (let x1 = x0; x1 < COLS; x1++) {
+        const v = valOf(g[x1][y]);
+        if (v === 0) break;
+        sum += v;
+        if (sum > TARGET) break;
+        if (sum === TARGET && x1 > x0) {
+          const keys = [];
+          for (let x = x0; x <= x1; x++) keys.push(keyOf(x, y));
+          runs.push({ keys });
+        }
+      }
+    }
+  }
+  for (let x = 0; x < COLS; x++) {
+    for (let y0 = 0; y0 < ROWS; y0++) {
+      let sum = 0;
+      for (let y1 = y0; y1 < ROWS; y1++) {
+        const v = valOf(g[x][y1]);
+        if (v === 0) break;
+        sum += v;
+        if (sum > TARGET) break;
+        if (sum === TARGET && y1 > y0) {
+          const keys = [];
+          for (let y = y0; y <= y1; y++) keys.push(keyOf(x, y));
+          runs.push({ keys });
+        }
+      }
+    }
+  }
+  return runs;
+}
+
+const unionKeys = runs => [...new Set([].concat(...runs.map(r => r.keys)))];
+const bonus = len => (len <= 2 ? 1 : len === 3 ? 1.5 : 2);
+
+// Per-tile points: 10 x bonus of the longest run through that tile (shared tiles count once).
+// A fully cleared row (all COLS cells) adds a flat +500.
+function scoreRuns(runs) {
+  const longest = new Map();
+  for (const r of runs) for (const k of r.keys) longest.set(k, Math.max(longest.get(k) || 0, r.keys.length));
+  let points = 0;
+  for (const len of longest.values()) points += 10 * bonus(len);
+  let fullRows = 0;
+  for (let y = 0; y < ROWS; y++) {
+    let n = 0;
+    for (let x = 0; x < COLS; x++) if (longest.has(keyOf(x, y))) n++;
+    if (n === COLS) fullRows++;
+  }
+  return { keys: [...longest.keys()], points, fullRows };
+}
+
+function removeKeys(g, keys) {
+  const set = new Set(keys);
+  return g.map((col, x) => col.map((c, y) => (set.has(keyOf(x, y)) ? null : c)));
+}
+
+// Gravity: every column compacts downward. Returns the new grid and the moves made.
+function gravity(g) {
+  const moves = [];
+  const out = g.map((col, x) => {
+    const next = Array(ROWS).fill(null);
+    let i = 0;
+    for (let y = 0; y < ROWS; y++) {
+      if (col[y] === null) continue;
+      next[i] = col[y];
+      if (i !== y) moves.push({ x, fromY: y, toY: i, c: col[y] });
+      i++;
+    }
+    return next;
+  });
+  return { g: out, moves };
+}
+
+// Rocks orthogonally adjacent to any of the given keys (destroyed by a clear).
+function rocksNextTo(g, keys) {
+  const found = new Set();
+  for (const k of keys) {
+    const [x, y] = unkey(k);
+    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      const nx = x + dx, ny = y + dy;
+      if (nx < 0 || ny < 0 || nx >= COLS || ny >= ROWS) continue;
+      if (g[nx][ny] === 0) found.add(keyOf(nx, ny));
+    }
+  }
+  return [...found];
+}
+
+// Lowest empty row in column x, or -1 if the column is full.
+function landingY(g, x) {
+  for (let y = 0; y < ROWS; y++) if (g[x][y] === null) return y;
+  return -1;
+}
+
+function overflowed(g) {
+  return g.some(col => col[ROWS - 1] !== null);
+}
+
+// Shift everything up one row and insert vals at the bottom. Caller must check overflowed() first.
+function pushRow(g, vals) {
+  return g.map((col, x) => [vals[x]].concat(col.slice(0, ROWS - 1)));
+}
+
+// Garbage row of values 1..9 that leaves no clear on the board (rejection sampling).
+function makeGarbage(g, rnd = Math.random) {
+  let out = g;
+  for (let attempt = 0; attempt < 300; attempt++) {
+    const vals = [];
+    for (let x = 0; x < COLS; x++) vals.push(1 + Math.floor(rnd() * 9));
+    out = pushRow(g, vals);
+    if (findClears(out).length === 0) return out;
+  }
+  return out;
+}
+
+// Value a wild takes when landing at (x,y): the one giving the most tiles cleared immediately; 5 if none.
+function bestWildValue(g, x, y) {
+  let best = 0, bestN = 0;
+  for (let v = 1; v <= 9; v++) {
+    const g2 = copyGrid(g);
+    g2[x][y] = v;
+    const n = unionKeys(findClears(g2)).length;
+    if (n > bestN) { bestN = n; best = v; }
+  }
+  return bestN > 0 ? best : 5;
+}
+
+// Cell code a tile becomes when it lands. kind: 'n' number, 'w' wild, 'r' rock.
+function codeFor(tile, wildValue) {
+  if (tile.kind === 'r') return 0;
+  if (tile.kind === 'w') return WILD_OFF + wildValue;
+  return tile.v;
+}
+
+// Hypothetical drop for previews: the grid with code placed at (x,y) and the clears it causes.
+function simulateDrop(g, x, y, code) {
+  const g2 = copyGrid(g);
+  g2[x][y] = code;
+  return { g2, runs: findClears(g2) };
+}
+// @pure-end
+
+/* ---------- 2. CONFIG & STATE ---------- */
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const BEST_KEY = 'tenfall.best';
+const STEP = 1 / 60;                       // fixed simulation step (s)
+const DROP_T = 0.15, FLASH_T = 0.32, SETTLE_T = 0.2;
+const PAD = 2;                             // tile inset (px)
+const TILE_WEIGHTS = [3, 3, 3, 3, 3, 2, 2, 2, 2]; // values 1..9
+const C_LO = [76, 201, 240], C_MID = [181, 23, 158], C_HI = [247, 37, 133];
+const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif';
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const pressureSpan = lv => Math.max(3, 8 - 0.5 * Math.max(0, lv - 2)); // seconds, level 2 = 8
+
+let best = 0;
+try { best = parseInt(localStorage.getItem(BEST_KEY), 10) || 0; } catch (e) { best = 0; }
+function saveBest() { try { localStorage.setItem(BEST_KEY, String(best)); } catch (e) { /* storage blocked */ } }
+
+// Layout (set by layout())
+let W = 0, H = 0, dpr = 1, narrow = false, cell = 40, bx = 0, by = 0, uiScale = 1, ovScale = 1;
+let panel = { x: 0, y: 0, w: 0, h: 0 };
+let HUD = {};
+
+// Game state
+let state = 'title';   // title | playing | paused | over
+let phase = 'idle';   // idle | drop | resolve | flash | settle (only meaningful while playing)
+let grid = emptyGrid();
+let cur = null, next1 = null, next2 = null, hold = null, holdUsed = false;
+let cursorX = 2, score = 0, cleared = 0, level = 1, drops = 0, tileCount = 0;
+let chainStep = 0, chainMax = 0, pressureT = 8;
+let dropTile = null, dropCode = 0, dropX = 0, dropY = 0, dropT = 0;
+let flashKeys = [], flashT = 0, settleT = 0, fallAnims = [];
+let particles = [], pops = [], shake = 0, chainLabel = 0, chainLabelT = 0;
+let overT = 0, clock = 0, startBest = 0, newBest = false;
+let down = null;
+let pendingDrop = null;               // column of a drop pressed during drop/flash/settle
+let squashX = 0, squashY = 0, squashT = 0;  // landing squash tween
+
+// Exposed for the smoke test; kept in sync every frame.
+const game = window.__game = { state, score, level, best, cleared, chainMax };
+function syncGame() {
+  game.state = state; game.score = score; game.level = level;
+  game.best = best; game.cleared = cleared; game.chainMax = chainMax;
+}
+
+/* ---------- 3. AUDIO (WebAudio synthesis; created on first user input) ---------- */
+let ac = null, master = null;
+function ensureAudio() {
+  try {
+    if (ac) { if (ac.state === 'suspended') ac.resume().catch(() => {}); return; }
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    ac = new AC();
+    master = ac.createGain();
+    master.gain.value = 0.35;
+    master.connect(ac.destination);
+  } catch (e) { ac = null; master = null; }
+}
+function tone(freq, dur, type, vol, slideTo = 0, delay = 0) {
+  if (!ac || !master) return;
+  try {
+    const t0 = ac.currentTime + delay;
+    const o = ac.createOscillator(), g = ac.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(freq, t0);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(Math.max(20, slideTo), t0 + dur);
+    g.gain.setValueAtTime(vol, t0);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    o.connect(g); g.connect(master);
+    o.start(t0); o.stop(t0 + dur + 0.02);
+  } catch (e) { /* audio unavailable */ }
+}
+function sfx(name, arg) {
+  switch (name) {
+    case 'drop': tone(160, 0.12, 'sine', 0.25, 60); break;                 // soft thunk
+    case 'clear': tone(440 * Math.pow(1.25, arg - 1), 0.14, 'square', 0.06); break; // rises per chain step
+    case 'rumble': tone(55, 0.5, 'triangle', 0.3, 35); break;              // garbage
+    case 'over': tone(330, 0.6, 'sawtooth', 0.12, 55); break;
+    case 'hold': tone(620, 0.08, 'triangle', 0.12); break;
+    case 'level': tone(660, 0.1, 'square', 0.07); tone(880, 0.14, 'square', 0.07, 0, 0.1); break;
+  }
+}
+
+/* ---------- 4. GAME FLOW ---------- */
+// Tile objects: {kind: 'n' | 'w' | 'r', v}. Wild has v = 0 until it lands.
+function newTile() {
+  tileCount++;
+  if (tileCount % 8 === 0) {                       // every 8th tile: complement of a board top
+    const tops = [];
+    for (let x = 0; x < COLS; x++) {
+      for (let y = ROWS - 1; y >= 0; y--) {
+        if (grid[x][y] !== null) { const v = valOf(grid[x][y]); if (v > 0) tops.push(v); break; }
+      }
+    }
+    if (tops.length) return { kind: 'n', v: TARGET - tops[Math.floor(Math.random() * tops.length)] };
+  }
+  if (level >= 4 && Math.random() < 1 / 15) return { kind: 'r', v: 0 };
+  if (level >= 3 && Math.random() < 1 / 25) return { kind: 'w', v: 0 };
+  let r = Math.random() * 23, v = 1;
+  for (; v < 9; v++) { r -= TILE_WEIGHTS[v - 1]; if (r < 0) break; }
+  return { kind: 'n', v };
+}
+
+function startGame() {
+  ensureAudio();
+  grid = emptyGrid();
+  score = 0; cleared = 0; level = 1; drops = 0; tileCount = 0;
+  hold = null; holdUsed = false; cursorX = 2; chainStep = 0; chainMax = 0;
+  particles = []; pops = []; fallAnims = []; flashKeys = [];
+  shake = 0; chainLabelT = 0; overT = 0; newBest = false; startBest = best;
+  pendingDrop = null; squashT = 0;
+  cur = newTile(); next1 = newTile(); next2 = newTile();
+  pressureT = pressureSpan(1);
+  phase = 'idle'; state = 'playing';
+  syncGame();
+}
+
+function gameOver() {
+  if (state === 'over') return;
+  state = 'over'; phase = 'idle'; overT = 0;
+  newBest = score > 0 && score > startBest;
+  saveBest();
+  sfx('over');
+  shake = Math.max(shake, 6);
+}
+
+function pause() { if (state === 'playing') state = 'paused'; }
+function resume() { if (state === 'paused') state = 'playing'; }
+
+function addScore(n) {
+  if (n <= 0) return;
+  score += n;
+  if (score > best) { best = score; saveBest(); }
+}
+
+// Player (or the pressure timer) drops the current tile in the cursor column.
+function doDrop() {
+  if (state !== 'playing' || phase !== 'idle') return;
+  const x = cursorX, y = landingY(grid, x);
+  if (y < 0) { gameOver(); return; }                 // dropping into a full column
+  const wv = cur.kind === 'w' ? bestWildValue(grid, x, y) : 0;
+  dropTile = cur; dropCode = codeFor(cur, wv);
+  dropX = x; dropY = y; dropT = DROP_T; phase = 'drop';
+  cur = next1; next1 = next2; next2 = newTile();
+  chainStep = 0; drops++;
+  sfx('drop');
+}
+
+// Manual drop request: buffered (one pending) while the board is animating.
+function requestDrop() {
+  if (state !== 'playing') return;
+  if (phase !== 'idle') { pendingDrop = cursorX; return; }
+  doDrop();
+}
+
+// Nearest column (by distance from x) that still has room, or -1 if all are full.
+function nearestOpenColumn(x) {
+  for (let d = 0; d < COLS; d++) {
+    for (const c of [x - d, x + d]) if (c >= 0 && c < COLS && landingY(grid, c) >= 0) return c;
+  }
+  return -1;
+}
+
+// Pressure timer expired: drop in the cursor column, or the nearest open one. Game over only if all are full.
+function autoDrop() {
+  const c = nearestOpenColumn(cursorX);
+  if (c < 0) { gameOver(); return; }
+  cursorX = c;
+  doDrop();
+}
+
+// Swap current with hold (or stash it the first time). Once per drop.
+function doHold() {
+  if (state !== 'playing' || phase !== 'idle' || holdUsed) return;
+  if (hold === null) { hold = cur; cur = next1; next1 = next2; next2 = newTile(); }
+  else { const t = hold; hold = cur; cur = t; }
+  holdUsed = true;
+  sfx('hold');
+}
+
+// Called when the board is settled after a drop. Handles garbage and spawns the next drop.
+function endDrop() {
+  phase = 'idle';
+  holdUsed = false;
+  if (level >= 5 && drops % 10 === 0) {
+    if (overflowed(grid)) { gameOver(); return; }
+    grid = makeGarbage(grid);
+    shake = Math.max(shake, 4);
+    sfx('rumble');
+    pops.push(pop('GARBAGE', COLS / 2, ROWS - 0.6, '#f72585', 0.6));
+  }
+  pressureT = pressureSpan(level);
+}
+
+// One clear step: find runs, score them, flash the cells.
+function resolveStep() {
+  const runs = findClears(grid);
+  if (runs.length === 0) { endDrop(); return; }
+  chainStep++;
+  if (chainStep > chainMax) chainMax = chainStep;
+  const sc = scoreRuns(runs);
+  const gain = sc.points * chainStep + sc.fullRows * 500;
+  addScore(gain);
+  cleared += sc.keys.length;
+  flashKeys = sc.keys; flashT = FLASH_T; phase = 'flash';
+  let cx = 0, cy = 0;
+  for (const k of sc.keys) { const [x, y] = unkey(k); cx += x + 0.5; cy += y + 0.5; }
+  cx /= sc.keys.length; cy /= sc.keys.length;
+  pops.push(pop('10!', cx, cy + 0.2, '#ffd166', 0.7));
+  pops.push(pop('+' + gain, cx, cy - 0.7, '#ffffff', 0.45));
+  if (chainStep >= 2) { chainLabel = chainStep; chainLabelT = 1.2; }
+  if (chainStep >= 3) shake = Math.max(shake, 3);
+  sfx('clear', chainStep);
+  const nl = 1 + Math.floor(cleared / 15);
+  if (nl > level) {
+    level = nl;
+    pops.push(pop('LEVEL ' + level, COLS / 2, ROWS - 0.6, '#4cc9f0', 0.6));
+    sfx('level');
+  }
+}
+
+// After the flash: remove cleared tiles and adjacent rocks, then apply gravity.
+function removeAndFall() {
+  const rocks = rocksNextTo(grid, flashKeys);
+  for (const k of flashKeys) {
+    const [x, y] = unkey(k);
+    burst(x + 0.5, y + 0.5, tileColor(valOf(grid[x][y])), 16);
+  }
+  for (const k of rocks) { const [x, y] = unkey(k); burst(x + 0.5, y + 0.5, '#8a909c', 10); }
+  grid = removeKeys(grid, flashKeys.concat(rocks));
+  const res = gravity(grid);
+  grid = res.g;
+  fallAnims = res.moves;
+  shake = Math.max(shake, 1.2);
+  settleT = SETTLE_T; phase = 'settle';
+}
+
+function update(dt) {
+  switch (phase) {
+    case 'idle':
+      if (pendingDrop !== null) { cursorX = pendingDrop; pendingDrop = null; doDrop(); break; }
+      if (level >= 2) { pressureT -= dt; if (pressureT <= 0) autoDrop(); }
+      break;
+    case 'drop':
+      dropT -= dt;
+      if (dropT <= 0) {
+        grid[dropX][dropY] = dropCode;
+        squashX = dropX; squashY = dropY; squashT = 0.12;
+        phase = 'resolve';
+      }
+      break;
+    case 'resolve': resolveStep(); break;
+    case 'flash': flashT -= dt; if (flashT <= 0) removeAndFall(); break;
+    case 'settle': settleT -= dt; if (settleT <= 0) { fallAnims = []; phase = 'resolve'; } break;
+  }
+}
+
+// Hypothetical landing for the cursor column: ghost position and the 10-highlight cells.
+function previewInfo() {
+  if (state !== 'playing' || phase !== 'idle' || !cur) return null;
+  const x = cursorX, y = landingY(grid, x);
+  if (y < 0) return { x, y: -1, full: true, keys: [], code: 0 };
+  const wv = cur.kind === 'w' ? bestWildValue(grid, x, y) : 0;
+  const code = codeFor(cur, wv);
+  const sim = simulateDrop(grid, x, y, code);
+  return { x, y, full: false, code, keys: unionKeys(sim.runs) };
+}
+
+/* ---------- 5. LAYOUT ---------- */
+function layout() {
+  W = window.innerWidth; H = window.innerHeight;
+  dpr = Math.min(window.devicePixelRatio || 1, 3);
+  canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
+  canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+  narrow = W < 520;
+  if (narrow) {
+    const hudH = 124, availH = H - hudH;
+    cell = Math.max(8, Math.floor(Math.min((W - 16) / COLS, (availH - 12) / (ROWS + 1.2))));
+    const blockH = (ROWS + 1.2) * cell;
+    const top = hudH + Math.max(0, (availH - blockH) / 2);
+    bx = (W - COLS * cell) / 2;
+    by = top + 1.2 * cell;
+    panel = { x: 0, y: 0, w: W, h: hudH };
+    uiScale = 1;
+  } else {
+    const pw = clamp(W * 0.26, 180, 250);
+    cell = Math.max(8, Math.floor(Math.min((W - pw - 90) / COLS, (H - 40) / (ROWS + 1.2))));
+    const bw = COLS * cell, blockH = (ROWS + 1.2) * cell;
+    const x0 = Math.max(8, (W - (bw + 32 + pw)) / 2);
+    const y0 = Math.max(8, (H - blockH) / 2);
+    bx = x0; by = y0 + 1.2 * cell;
+    panel = { x: x0 + bw + 32, y: y0, w: pw, h: blockH };
+    uiScale = clamp(blockH / 470, 0.6, 1.3);
+  }
+  ovScale = clamp(Math.min(W / 420, H / 640), 0.6, 1.3);
+  buildHud();
+}
+
+// HUD rectangles (shared by drawing and hit tests).
+function buildHud() {
+  const h = {};
+  if (narrow) {
+    h.score = { x: 10, y: 4, w: W * 0.36, h: 40 };
+    h.level = { x: 10 + W * 0.36, y: 4, w: W * 0.22, h: 40 };
+    h.best = { x: 10 + W * 0.58, y: 4, w: W * 0.42 - 50, h: 40 };
+    h.pause = { x: W - 40, y: 6, w: 30, h: 30 };
+    h.hold = { x: 10, y: 52, w: 64, h: 64 };
+    h.cur = { x: W / 2 - 34, y: 50, w: 68, h: 68 };
+    h.next1 = { x: W - 10 - 84, y: 66, w: 40, h: 40 };
+    h.next2 = { x: W - 10 - 40, y: 66, w: 40, h: 40 };
+    h.pressure = { x: 10, y: panel.h - 7, w: W - 20, h: 4 };
+  } else {
+    const px = panel.x, py = panel.y, pw = panel.w, U = uiScale;
+    h.score = { x: px, y: py, w: pw - 40 * U, h: 58 * U };
+    h.pause = { x: px + pw - 32 * U, y: py, w: 32 * U, h: 32 * U };
+    h.level = { x: px, y: py + 64 * U, w: pw / 2 - 4 * U, h: 48 * U };
+    h.best = { x: px + pw / 2 + 4 * U, y: py + 64 * U, w: pw / 2 - 4 * U, h: 48 * U };
+    h.cur = { x: px + pw / 2 - 46 * U, y: py + 150 * U, w: 92 * U, h: 92 * U };
+    h.hold = { x: px, y: py + 280 * U, w: 84 * U, h: 84 * U };
+    h.next1 = { x: px + pw - 60 * U, y: py + 280 * U, w: 60 * U, h: 60 * U };
+    h.next2 = { x: px + pw - 44 * U, y: py + 348 * U, w: 44 * U, h: 44 * U };
+    h.pressure = { x: px, y: py + 420 * U, w: pw, h: 10 * U };
+  }
+  HUD = h;
+}
+
+const hit = (p, r) => !!r && p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h;
+const cellX = x => bx + x * cell;
+const rowTop = y => by + (ROWS - 1 - y) * cell;
+function colAt(px) { return clamp(Math.floor((px - bx) / cell), 0, COLS - 1); }
+function inBoardZone(p) {
+  return p.x >= bx && p.x < bx + COLS * cell && p.y >= by - 1.2 * cell && p.y <= by + ROWS * cell;
+}
+
+/* ---------- 6. INPUT ---------- */
+function localPos(e) {
+  const r = canvas.getBoundingClientRect();
+  return { x: e.clientX - r.left, y: e.clientY - r.top };
+}
+
+canvas.addEventListener('pointerdown', e => {
+  ensureAudio();
+  const p = localPos(e);
+  if (state === 'title') { startGame(); return; }
+  if (state === 'paused') { resume(); return; }
+  if (state === 'over') { if (overT > 0.6) startGame(); return; }
+  if (hit(p, HUD.pause)) { pause(); return; }
+  if (hit(p, HUD.hold)) { doHold(); return; }
+  if (inBoardZone(p)) {
+    cursorX = colAt(p.x);
+    down = { x: p.x, y: p.y, moved: false };
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+  }
+});
+
+canvas.addEventListener('pointermove', e => {
+  if (state !== 'playing') return;
+  const p = localPos(e);
+  if (down) {
+    if (Math.hypot(p.x - down.x, p.y - down.y) > 10) down.moved = true;
+    if (down.moved && inBoardZone(p)) cursorX = colAt(p.x);   // drag moves the cursor only
+  } else if (inBoardZone(p)) {
+    cursorX = colAt(p.x);                                     // hover (mouse) or tap-free aiming
+  }
+});
+
+canvas.addEventListener('pointerup', () => {
+  if (down && !down.moved && state === 'playing') requestDrop();   // tap = drop in tapped column
+  down = null;
+});
+canvas.addEventListener('pointercancel', () => { down = null; });
+
+window.addEventListener('keydown', e => {
+  ensureAudio();
+  const k = e.key;
+  if (['ArrowLeft', 'ArrowRight', 'ArrowDown', 'ArrowUp', ' '].includes(k)) e.preventDefault();
+  if (state === 'title') { if (k === 'Enter' || k === ' ') startGame(); return; }
+  if (state === 'over') { if ((k === 'Enter' || k === ' ') && overT > 0.6 && !e.repeat) startGame(); return; }
+  if (state === 'paused') { if (k === 'p' || k === 'P' || k === 'Escape') resume(); return; }
+  switch (k) {
+    case 'ArrowLeft': case 'a': case 'A': cursorX = Math.max(0, cursorX - 1); break;
+    case 'ArrowRight': case 'd': case 'D': cursorX = Math.min(COLS - 1, cursorX + 1); break;
+    case 'ArrowDown': case ' ': case 's': case 'S': if (!e.repeat) requestDrop(); break;
+    case 'c': case 'C': case 'Shift': if (!e.repeat) doHold(); break;
+    case 'p': case 'P': case 'Escape': if (!e.repeat) pause(); break;
+  }
+});
+
+document.addEventListener('visibilitychange', () => { if (document.hidden) pause(); });
+window.addEventListener('resize', layout);
+
+/* ---------- 7. RENDERING ---------- */
+const FX_MAX = 300;
+function burst(x, y, color, n) {
+  for (let i = 0; i < n && particles.length < FX_MAX; i++) {
+    const life = 0.5 + Math.random() * 0.45;
+    particles.push({ x, y, vx: (Math.random() - 0.5) * 5, vy: 1 + Math.random() * 4, life, max: life, color });
+  }
+}
+function pop(text, x, y, color, size) { return { text, x, y, life: 0.9, max: 0.9, color, size }; }
+
+function updateFx(dt) {
+  for (const p of particles) { p.x += p.vx * dt; p.y += p.vy * dt; p.vy -= 14 * dt; p.life -= dt; }
+  particles = particles.filter(p => p.life > 0);
+  for (const q of pops) { q.y += dt * 1.0; q.life -= dt; }
+  pops = pops.filter(q => q.life > 0);
+}
+
+const rainbow = h => 'hsl(' + (((h % 360) + 360) % 360) + ' 90% 62%)';
+function tileColor(v) {
+  const t = (clamp(v, 1, 9) - 1) / 8;
+  let a, b, f;
+  if (t <= 0.5) { a = C_LO; b = C_MID; f = t * 2; } else { a = C_MID; b = C_HI; f = (t - 0.5) * 2; }
+  const c = i => Math.round(a[i] + (b[i] - a[i]) * f);
+  return `rgb(${c(0)},${c(1)},${c(2)})`;
+}
+function setFont(size, weight) { ctx.font = `${weight || 700} ${Math.max(1, size)}px ${FONT}`; }
+function txt(s, x, y, size, color, align, weight) {
+  setFont(size, weight);
+  ctx.fillStyle = color; ctx.textAlign = align || 'left'; ctx.textBaseline = 'middle';
+  ctx.fillText(s, x, y);
+}
+function rr(x, y, w, h, r) {
+  r = Math.max(0, Math.min(r, w / 2, h / 2));
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+// code: 0 rock, 1..9 number, 11..19 wild (value known), -1 wild not yet landed (star only)
+function drawTile(px, py, s, code, alpha, flash) {
+  ctx.save();
+  ctx.globalAlpha = alpha === undefined ? 1 : alpha;
+  const r = s * 0.18;
+  rr(px, py, s, s, r);
+  if (code === 0) {
+    ctx.fillStyle = '#555a66'; ctx.fill();
+    txt('■', px + s / 2, py + s / 2, s * 0.42, '#8a909c', 'center');
+  } else if (code === -1) {
+    const g = ctx.createLinearGradient(px, py, px + s, py + s);
+    g.addColorStop(0, rainbow(clock * 90)); g.addColorStop(1, rainbow(clock * 90 + 160));
+    ctx.fillStyle = g; ctx.fill();
+    txt('★', px + s / 2, py + s / 2, s * 0.55, '#ffffff', 'center');
+  } else {
+    const wild = code > WILD_OFF, v = valOf(code);
+    if (wild) {
+      const g = ctx.createLinearGradient(px, py, px + s, py + s);
+      g.addColorStop(0, rainbow(clock * 90 + v * 40)); g.addColorStop(1, rainbow(clock * 90 + v * 40 + 160));
+      ctx.fillStyle = g;
+    } else {
+      ctx.fillStyle = tileColor(v);
+    }
+    ctx.fill();
+    rr(px + s * 0.08, py + s * 0.06, s * 0.84, s * 0.36, r * 0.7);
+    ctx.fillStyle = 'rgba(255,255,255,0.18)'; ctx.fill();
+    txt(String(v), px + s / 2, py + s / 2 + s * 0.04, s * 0.52, '#ffffff', 'center', 800);
+    if (wild) txt('★', px + s * 0.2, py + s * 0.2, s * 0.24, '#ffffff', 'center');
+  }
+  if (flash) {
+    rr(px, py, s, s, r);
+    ctx.globalAlpha = (alpha === undefined ? 1 : alpha) * (0.55 + 0.45 * Math.sin(clock * 40));
+    ctx.fillStyle = '#ffffff'; ctx.fill();
+  }
+  ctx.restore();
+}
+
+const tileDisplayCode = t => (t.kind === 'r' ? 0 : t.kind === 'w' ? -1 : t.v);
+
+function drawWell() {
+  ctx.save();
+  if (shake > 0) ctx.translate((Math.random() * 2 - 1) * shake, (Math.random() * 2 - 1) * shake);
+  const bw = COLS * cell, bh = ROWS * cell;
+  rr(bx - 6, by - 6, bw + 12, bh + 12, 12);
+  ctx.fillStyle = '#1f1c33'; ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.05)'; ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let x = 1; x < COLS; x++) { ctx.moveTo(bx + x * cell, by); ctx.lineTo(bx + x * cell, by + bh); }
+  for (let y = 1; y < ROWS; y++) { ctx.moveTo(bx, by + y * cell); ctx.lineTo(bx + bw, by + y * cell); }
+  ctx.stroke();
+
+  const S = cell - 2 * PAD;
+  const pv = previewInfo();
+  if (pv) {
+    if (pv.full) {
+      ctx.fillStyle = 'rgba(247,37,133,0.14)';
+      ctx.fillRect(cellX(pv.x), by, cell, bh);
+    } else {
+      drawTile(cellX(pv.x) + PAD, rowTop(pv.y) + PAD, S, pv.code, 0.28, false);
+      for (const k of pv.keys) {
+        const [x, y] = unkey(k);
+        ctx.save();
+        ctx.globalAlpha = 0.5 + 0.4 * Math.sin(clock * 8);
+        rr(cellX(x) + 1.5, rowTop(y) + 1.5, cell - 3, cell - 3, cell * 0.18);
+        ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2.5; ctx.stroke();
+        ctx.restore();
+      }
+    }
+  }
+
+  // Settled tiles (skip ones animating through gravity).
+  const flashing = new Set(phase === 'flash' ? flashKeys : []);
+  const moving = new Set(phase === 'settle' ? fallAnims.map(m => keyOf(m.x, m.toY)) : []);
+  for (let x = 0; x < COLS; x++) {
+    for (let y = 0; y < ROWS; y++) {
+      const c = grid[x][y];
+      if (c === null) continue;
+      const k = keyOf(x, y);
+      if (moving.has(k)) continue;
+      if (squashT > 0 && x === squashX && y === squashY) {
+        const k2 = squashT / 0.12, cx0 = cellX(x) + cell / 2, cy0 = rowTop(y) + cell / 2;
+        ctx.save();
+        ctx.translate(cx0, cy0); ctx.scale(1 + 0.14 * k2, 1 - 0.14 * k2); ctx.translate(-cx0, -cy0);
+        drawTile(cellX(x) + PAD, rowTop(y) + PAD, S, c, 1, flashing.has(k));
+        ctx.restore();
+      } else {
+        drawTile(cellX(x) + PAD, rowTop(y) + PAD, S, c, 1, flashing.has(k));
+      }
+    }
+  }
+  if (phase === 'settle') {
+    const p = 1 - settleT / SETTLE_T, e = 1 - (1 - p) * (1 - p);
+    for (const m of fallAnims) {
+      const yy = m.fromY + (m.toY - m.fromY) * e;
+      drawTile(cellX(m.x) + PAD, rowTop(yy) + PAD, S, m.c, 1, false);
+    }
+  }
+  // Tile currently falling into the well.
+  if (phase === 'drop') {
+    const p = 1 - dropT / DROP_T, e = p * p;
+    const yy = ROWS + (dropY - ROWS) * e;
+    drawTile(cellX(dropX) + PAD, rowTop(yy) + PAD, S, dropCode, 1, false);
+  }
+  // Current tile floating above the cursor column.
+  if (state === 'playing' && cur && phase === 'idle') {
+    drawTile(cellX(cursorX) + PAD, by - cell + PAD, S, tileDisplayCode(cur), 1, false);
+  }
+
+  // Particles and pops (board units).
+  for (const p of particles) {
+    ctx.globalAlpha = Math.max(0, p.life / p.max);
+    ctx.fillStyle = p.color;
+    const s = Math.max(2, cell * 0.18);
+    ctx.fillRect(bx + p.x * cell - s / 2, by + (ROWS - p.y) * cell - s / 2, s, s);
+  }
+  ctx.globalAlpha = 1;
+  for (const q of pops) {
+    ctx.globalAlpha = Math.min(1, q.life / q.max * 1.6);
+    txt(q.text, bx + q.x * cell, by + (ROWS - q.y) * cell, q.size * cell, q.color, 'center', 800);
+  }
+  ctx.globalAlpha = 1;
+
+  if (chainLabelT > 0 && state === 'playing') {
+    const a = Math.min(1, chainLabelT * 2);
+    ctx.globalAlpha = a;
+    txt('CHAIN ×' + chainLabel, bx + bw / 2, by + bh * 0.4, cell * 0.7, '#ffd166', 'center', 800);
+    ctx.globalAlpha = 1;
+  }
+  ctx.restore();
+}
+
+function stat(label, value, r, fs, U) {
+  txt(label, r.x + 2, r.y + 9 * U, 10 * U, '#8a84ab', 'left', 700);
+  txt(String(value), r.x + 2, r.y + r.h * 0.7, fs, '#ffffff', 'left', 800);
+}
+
+function box(r, label, tile, U) {
+  rr(r.x, r.y, r.w, r.h, 10 * U);
+  ctx.fillStyle = '#1f1c33'; ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.08)'; ctx.lineWidth = 1; ctx.stroke();
+  if (tile) {
+    const p = r.w * 0.1;
+    drawTile(r.x + p, r.y + p, r.w - 2 * p, tileDisplayCode(tile), 1, false);
+  } else if (label) {
+    txt(label, r.x + r.w / 2, r.y + r.h / 2, 11 * U, '#6f6a8f', 'center');
+  }
+}
+
+function drawHud() {
+  const U = narrow ? 1 : uiScale;
+  const bigFs = narrow ? 20 : 30 * U, midFs = narrow ? 17 : 20 * U;
+  stat('SCORE', score, HUD.score, bigFs, U);
+  stat('LEVEL', level, HUD.level, midFs, U);
+  stat('BEST', best, HUD.best, midFs, U);
+
+  // pause button
+  const P = HUD.pause;
+  rr(P.x, P.y, P.w, P.h, 8 * U); ctx.fillStyle = 'rgba(255,255,255,0.08)'; ctx.fill();
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(P.x + P.w * 0.34, P.y + P.h * 0.28, P.w * 0.14, P.h * 0.44);
+  ctx.fillRect(P.x + P.w * 0.52, P.y + P.h * 0.28, P.w * 0.14, P.h * 0.44);
+
+  if (narrow) {
+    box(HUD.hold, 'HOLD', hold, U);
+    box(HUD.cur, '', cur, U);
+    txt('NEXT', HUD.next1.x, HUD.next1.y - 9, 9, '#8a84ab', 'left');
+    box(HUD.next1, '', next1, U);
+    box(HUD.next2, '', next2, U);
+  } else {
+    txt('NOW', HUD.cur.x + HUD.cur.w / 2, HUD.cur.y - 10 * U, 10 * U, '#8a84ab', 'center');
+    txt('HOLD (C)', HUD.hold.x, HUD.hold.y - 10 * U, 10 * U, '#8a84ab', 'left');
+    txt('NEXT', HUD.next1.x, HUD.next1.y - 10 * U, 10 * U, '#8a84ab', 'left');
+    box(HUD.hold, 'HOLD', hold, U);
+    box(HUD.cur, '', cur, U);
+    box(HUD.next1, '', next1, U);
+    box(HUD.next2, '', next2, U);
+  }
+
+  const pr = HUD.pressure;
+  rr(pr.x, pr.y, pr.w, pr.h, pr.h / 2); ctx.fillStyle = 'rgba(255,255,255,0.08)'; ctx.fill();
+  if (level >= 2) {
+    const f = clamp(pressureT / pressureSpan(level), 0, 1);
+    if (f > 0) {
+      rr(pr.x, pr.y, Math.max(pr.h, pr.w * f), pr.h, pr.h / 2);
+      ctx.fillStyle = f < 0.3 ? '#f72585' : '#4cc9f0'; ctx.fill();
+    }
+  }
+  if (!narrow) {
+    txt(level >= 2 ? 'PRESSURE' : 'PRESSURE (from level 2)', pr.x, pr.y - 10 * U, 10 * U, '#8a84ab', 'left');
+  }
+}
+
+function dim(a) { ctx.fillStyle = `rgba(20,18,31,${a})`; ctx.fillRect(0, 0, W, H); }
+
+function drawTitle() {
+  const s = ovScale;
+  dim(0.9);
+  const contentH = 450 * s;
+  let y = Math.max(12, (H - contentH) / 2);
+  const cx = W / 2;
+  // title with gradient
+  setFont(56 * s, 900);
+  const tg = ctx.createLinearGradient(cx - 120 * s, 0, cx + 120 * s, 0);
+  tg.addColorStop(0, 'rgb(76,201,240)'); tg.addColorStop(1, 'rgb(247,37,133)');
+  ctx.fillStyle = tg; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText('TENFALL', cx, y + 28 * s);
+  y += 70 * s;
+  txt('Make a straight line of tiles add up to exactly 10', cx, y, 13 * s, '#d9d4f0', 'center', 500);
+  y += 26 * s;
+  txt('HOW IT PLAYS', cx, y, 11 * s, '#8a84ab', 'center', 700);
+  y += 26 * s;
+
+  // three illustrated steps
+  const ts = 30 * s, gap = 4 * s, gx = cx - 150 * s;
+  const steps = [
+    { kind: 'h', codes: [3, 7], label: '3 + 7 = 10: shatters' },
+    { kind: 'h', codes: [2, 3, 5], label: '2 + 3 + 5 = 10: any run works' },
+    { kind: 'v', codes: [4, 6], label: 'Vertical: 4 over 6 = 10' },
+  ];
+  for (const st of steps) {
+    const rowH = 64 * s;
+    if (st.kind === 'h') {
+      st.codes.forEach((c, j) => drawTile(gx + j * (ts + gap), y + (rowH - ts) / 2, ts, c, 1, false));
+    } else {
+      st.codes.forEach((c, j) => drawTile(gx, y + j * (ts + gap) + (rowH - (2 * ts + gap)) / 2, ts, c, 1, false));
+    }
+    txt(st.label, gx + 110 * s, y + rowH / 2, 14 * s, '#ffffff', 'left', 600);
+    y += rowH;
+  }
+  y += 10 * s;
+  const ctl = [
+    '← → or A D move     ↓ / Space / S drop',
+    'C / Shift hold     P / Esc pause',
+    'Touch: drag to aim, tap to drop',
+  ];
+  for (const line of ctl) { txt(line, cx, y, 12 * s, '#b9b3d6', 'center', 500); y += 18 * s; }
+  y += 8 * s;
+  txt('BEST ' + best, cx, y, 16 * s, '#ffd166', 'center', 800);
+  y += 34 * s;
+  const blink = 0.6 + 0.4 * Math.sin(clock * 4);
+  ctx.globalAlpha = blink;
+  txt('TAP or press ENTER to start', cx, y, 15 * s, '#ffffff', 'center', 800);
+  ctx.globalAlpha = 1;
+}
+
+function drawPaused() {
+  const s = ovScale;
+  dim(0.72);
+  txt('PAUSED', W / 2, H / 2 - 20 * s, 40 * s, '#ffffff', 'center', 900);
+  txt('Press P or Esc, or tap to resume', W / 2, H / 2 + 24 * s, 14 * s, '#b9b3d6', 'center', 500);
+}
+
+function drawOver() {
+  const s = ovScale, cx = W / 2;
+  dim(0.82);
+  let y = Math.max(20, H / 2 - 130 * s);
+  txt('GAME OVER', cx, y, 36 * s, '#f72585', 'center', 900);
+  txt('SCORE', cx, y + 44 * s, 12 * s, '#8a84ab', 'center', 700);
+  txt(String(score), cx, y + 74 * s, 44 * s, '#ffffff', 'center', 900);
+  txt(newBest ? 'NEW BEST ' + best + '!' : 'BEST ' + best, cx, y + 120 * s, 16 * s, '#ffd166', 'center', 800);
+  txt('Longest chain ×' + chainMax + '   ·   Tiles cleared ' + cleared, cx, y + 148 * s, 14 * s, '#b9b3d6', 'center', 500);
+  const bw = 200 * s, bh = 44 * s, by2 = y + 190 * s;
+  rr(cx - bw / 2, by2, bw, bh, bh / 2);
+  ctx.fillStyle = '#4cc9f0'; ctx.fill();
+  txt('RETRY', cx, by2 + bh / 2, 16 * s, '#14121f', 'center', 900);
+  if (overT > 0.6) {
+    ctx.globalAlpha = 0.6 + 0.4 * Math.sin(clock * 4);
+    txt('Tap or press Enter to retry', cx, by2 + bh + 20 * s, 12 * s, '#b9b3d6', 'center', 500);
+    ctx.globalAlpha = 1;
+  }
+}
+
+function render() {
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = '#14121f';
+  ctx.fillRect(0, 0, W, H);
+  if (state === 'title') { drawTitle(); return; }   // title shows over a plain background only
+  drawWell();
+  drawHud();
+  if (state === 'paused') drawPaused();
+  else if (state === 'over') drawOver();
+}
+
+/* ---------- 8. MAIN LOOP (fixed step, dt clamped to 50 ms) ---------- */
+let lastNow = 0, acc = 0;
+function frame(now) {
+  const dt = Math.min(0.05, Math.max(0, (now - lastNow) / 1000));
+  lastNow = now;
+  clock += dt;
+  if (state === 'playing') {
+    acc += dt;
+    while (acc >= STEP && state === 'playing') { update(STEP); acc -= STEP; }
+    if (state !== 'playing') acc = 0;
+  } else {
+    acc = 0;
+  }
+  updateFx(dt);
+  if (state === 'over') overT += dt;
+  if (chainLabelT > 0) chainLabelT -= dt;
+  if (squashT > 0) squashT -= dt;
+  shake = Math.max(0, shake - dt * 12);
+  syncGame();
+  render();
+  requestAnimationFrame(frame);
+}
+
+layout();
+syncGame();
+lastNow = performance.now();
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
