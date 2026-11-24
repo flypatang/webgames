@@ -9,7 +9,7 @@ Check this before pitching so concepts and genres stay varied.
 | 4 | pulse-garden | Pulse Garden | rhythm | seeded generated songs, hits grow plants | shipped |
 | 5 | candle-crypt | Candle Crypt | turn-based roguelike | wax = HP + clock, light radius | shipped |
 | 6 | hedgewise | Hedgewise | maze-building tower defense | hedges reroute the path, gnomes sit on hedges | shipped |
-| 7 | drift-lines | Drift Lines | top-down racing | seeded tracks, drift fills boost, ghost | building |
+| 7 | drift-lines | Drift Lines | top-down racing | seeded tracks, drift fills boost, ghost | shipped |
 | 8 | soot-sprite | Soot Sprite | vertical platformer | wall-jump climber vs rising embers | shipped |
 
 ## Backlog (minor follow-ups)
