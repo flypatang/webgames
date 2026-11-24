@@ -1,0 +1,1387 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Hedgewise</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0c1510; overflow: hidden; }
+  canvas { display: block; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-tap-highlight-color: transparent; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<script id="logic">
+/* =====================================================================
+ * HEDGEWISE - pure game logic. No DOM access; tests load this block alone.
+ * Grid, BFS pathing, placement validation, waves, combat and economy.
+ * Randomness only through the seeded RNG stored on the state.
+ * ===================================================================== */
+var HW = (function () {
+  'use strict';
+
+  /* ---------- constants ---------- */
+  var COLS = 12, ROWS = 16, N = COLS * ROWS;
+  var ENTRANCE = 0 * COLS + 5;        // col 5, row 0
+  var EXIT = (ROWS - 1) * COLS + 6;   // col 6, row 15
+  var START_SEEDS = 60, START_LIVES = 20;
+  var HP_GROWTH = 1.21;               // per-wave HP multiplier base: scale = HP_GROWTH^(w-1)
+  var HEDGE_COST = 1, AUTO_HEDGE_COST = 8, BUILD_TIME = 20;
+  var SPAWN_GAP = 0.8, STEP = 1 / 60, SELL_NUM = 7, SELL_DEN = 10; // sell refund = floor(invested * 0.7)
+  var MAX_WAVE_CRITTERS = 40, ARMOR_MIN_DMG = 0.3;
+
+  var GNOME = {
+    pebble: { name: 'Pebble', cost: 10, range: [2.5, 2.5, 3], dmg: [1, 2, 3], rate: 0.6, up: [15, 25] },
+    frost:  { name: 'Frost', cost: 15, range: [2, 2, 2], dmg: [0.5, 0.5, 0.5], rate: 1, up: [20, 30], slow: [0.6, 0.45, 0.45], slowT: 1.5 },
+    bell:   { name: 'Bell', cost: 15, range: [1.5, 1.5, 2], dmg: [1.5, 2.5, 2.5], rate: 2, up: [25, 35] }
+  };
+  var CRITTER = {
+    slug:   { name: 'Slug', hp: 4, speed: 1.0, seeds: 1 },
+    beetle: { name: 'Beetle', hp: 10, speed: 0.7, seeds: 2, armor: 0.4 },
+    hare:   { name: 'Hare', hp: 3, speed: 2.0, seeds: 2 },
+    mole:   { name: 'Mole', hp: 7, speed: 0.9, seeds: 3, mole: true },
+    badger: { name: 'Boss Badger', hp: 60, speed: 0.5, seeds: 15, boss: true }
+  };
+  // Deterministic compositions for waves 1-10 (normal critters only; boss is added separately).
+  // Counts come from n = 6+2w (w<=3) or 8+2w (cap 40). Fixed order, no RNG.
+  var MOLE_FROM = 7;
+  var ORDER = ['slug', 'beetle', 'hare', 'mole'];
+  function fixedCounts(w, n) {
+    var m = Math.floor(n / 4);
+    switch (w) {
+      case 1: case 2: case 5: return { slug: n };
+      case 3: return { hare: 3, slug: n - 3 };
+      case 4: return { beetle: Math.floor(n / 3), slug: n - Math.floor(n / 3) };
+      case 6: return { hare: Math.floor(n / 2), beetle: n - Math.floor(n / 2) };
+      case 7: return { mole: 3, slug: n - 3 };
+      case 8: case 10: { // mixed: equal split, moles capped at 1/4
+        var others = n - m, base = Math.floor(others / 3);
+        return { mole: m, hare: base, beetle: base, slug: others - 2 * base };
+      }
+      case 9: { var mo = Math.floor(n / 4); return { mole: mo, beetle: n - mo }; } // 3/4 beetles, 1/4 moles
+    }
+    return null;
+  }
+  // Round-robin in fixed type order until the counts are used up.
+  function interleave(counts) {
+    var left = {}, out = [], total = 0, i, t;
+    ORDER.forEach(function (k) { left[k] = counts[k] || 0; total += left[k]; });
+    while (out.length < total) {
+      for (i = 0; i < ORDER.length; i++) {
+        t = ORDER[i];
+        if (left[t] > 0) { out.push(t); left[t]--; }
+      }
+    }
+    return out;
+  }
+
+  /* ---------- waves ---------- */
+  // Composition of wave w. Boss first on every 5th wave.
+  // Waves 1-10 are fixed; after wave 10 a seeded mix over the unlocked types, moles capped at 1/4.
+  function waveTypes(w, rng) {
+    var n = Math.min(MAX_WAVE_CRITTERS, w <= 3 ? 6 + 2 * w : 8 + 2 * w), list = [];
+    if (w % 5 === 0) list.push('badger');
+    if (w <= 10) return list.concat(interleave(fixedCounts(w, n)));
+    var moleCap = Math.floor(n / 4), moles = 0, unlocked = ['slug', 'beetle', 'hare'];
+    if (w >= MOLE_FROM) unlocked.push('mole');
+    for (var i = 0; i < n; i++) {
+      var pool = unlocked.filter(function (t) { return t !== 'mole' || moles < moleCap; });
+      var pick = pool[Math.floor(rng() * pool.length)];
+      if (pick === 'mole') moles++;
+      list.push(pick);
+    }
+    return list;
+  }
+
+  // Neighbour table (4-directional): up, right, down, left.
+  var NB = [];
+  for (var ci = 0; ci < N; ci++) {
+    var cr0 = Math.floor(ci / COLS), cc0 = ci % COLS, nbs = [];
+    if (cr0 > 0) nbs.push(ci - COLS);
+    if (cc0 < COLS - 1) nbs.push(ci + 1);
+    if (cr0 < ROWS - 1) nbs.push(ci + COLS);
+    if (cc0 > 0) nbs.push(ci - 1);
+    NB.push(nbs);
+  }
+
+  /* ---------- seeded RNG (mulberry32) ---------- */
+  function mulberry32(seed) {
+    var a = seed >>> 0;
+    return function () {
+      a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  /* ---------- grid helpers ---------- */
+  function xy(i) { return { c: i % COLS, r: Math.floor(i / COLS) }; }
+  function cellCenter(i) { return { x: (i % COLS) + 0.5, y: Math.floor(i / COLS) + 0.5 }; }
+  function dist2(a, b) { var dx = a.x - b.x, dy = a.y - b.y; return Math.sqrt(dx * dx + dy * dy); }
+
+  // Passability per field: 0 = normal critters (blocked by any hedge),
+  // 1 = moles (ignore hedges, blocked only by gnomes).
+  function pass(st, i, field) {
+    return field === 0 ? st.hedge[i] === 0 : st.gnome[i] === null;
+  }
+
+  // BFS distance (in steps) from the exit over the given field; -1 = unreachable.
+  function bfs(st, field) {
+    var d = new Int32Array(N).fill(-1);
+    var q = [EXIT];
+    d[EXIT] = 0;
+    for (var qi = 0; qi < q.length; qi++) {
+      var i = q[qi], nbs = NB[i];
+      for (var k = 0; k < nbs.length; k++) {
+        var j = nbs[k];
+        if (d[j] < 0 && pass(st, j, field)) { d[j] = d[i] + 1; q.push(j); }
+      }
+    }
+    return d;
+  }
+
+  function refresh(st) { st.dist = [bfs(st, 0), bfs(st, 1)]; }
+
+  // Next cell on a shortest path toward the exit, or -1.
+  function nextStep(st, i, field) {
+    var d = st.dist[field], di = d[i];
+    if (di <= 0) return -1;
+    var nbs = NB[i];
+    for (var k = 0; k < nbs.length; k++) if (d[nbs[k]] === di - 1) return nbs[k];
+    return -1;
+  }
+
+  // Current critter path (normal field) from the entrance to the exit.
+  function pathCells(st) {
+    var out = [], i = ENTRANCE, guard = 0;
+    if (st.dist[0][ENTRANCE] < 0) return out;
+    out.push(i);
+    while (i !== EXIT && guard++ < N) {
+      i = nextStep(st, i, 0);
+      if (i < 0) break;
+      out.push(i);
+    }
+    return out;
+  }
+
+  // Every living critter must still reach the exit in its own field,
+  // both where it stands and the cell it is walking toward.
+  function layoutOk(st) {
+    refresh(st);
+    if (st.dist[0][ENTRANCE] < 0) return false;
+    for (var k = 0; k < st.critters.length; k++) {
+      var cr = st.critters[k];
+      if (!cr.alive) continue;
+      var d = st.dist[cr.field];
+      if (d[cr.from] < 0 || (cr.to >= 0 && d[cr.to] < 0)) return false;
+    }
+    return true;
+  }
+
+  // Would the layout stay valid if cell idx had these values? Restores the state.
+  function layoutWith(st, idx, hedgeVal, gnomeVal) {
+    var h0 = st.hedge[idx], g0 = st.gnome[idx];
+    st.hedge[idx] = hedgeVal;
+    st.gnome[idx] = gnomeVal;
+    var ok = layoutOk(st);
+    st.hedge[idx] = h0;
+    st.gnome[idx] = g0;
+    refresh(st);
+    return ok;
+  }
+
+  // Critters on a cell (or walking to it) cannot be built over.
+  function isOccupied(st, idx) {
+    for (var k = 0; k < st.critters.length; k++) {
+      var cr = st.critters[k];
+      if (cr.alive && (cr.from === idx || cr.to === idx)) return true;
+    }
+    return false;
+  }
+
+  // Continuous position in cell units (interpolated between from and to).
+  function critterPos(cr) {
+    var a = cellCenter(cr.from);
+    if (cr.to < 0 || cr.to === cr.from) return a;
+    var b = cellCenter(cr.to);
+    return { x: a.x + (b.x - a.x) * cr.prog, y: a.y + (b.y - a.y) * cr.prog };
+  }
+
+  // Steps left to the exit, fractional: lower means further along.
+  function remaining(st, cr) { return st.dist[cr.field][cr.from] - cr.prog; }
+
+  /* ---------- game state ---------- */
+  function newGame(seed) {
+    var st = {
+      seed: seed,
+      rng: mulberry32(seed),
+      hedge: new Array(N).fill(0),   // 0 = none, otherwise seeds invested in the hedge
+      gnome: new Array(N).fill(null),// null or {type, level, invested, cd}
+      dist: null,
+      seeds: START_SEEDS, lives: START_LIVES,
+      wave: 0, wavesCleared: 0, kills: 0,
+      phase: 'build',                // 'build' | 'wave' | 'over'
+      buildLeft: Infinity,           // first build phase has no timer
+      queue: [], spawnT: 0,
+      critters: [], nextId: 1, time: 0,
+      nextComp: null,
+      fx: null,                      // optional event list for the view (null in tests)
+      stuck: 0
+    };
+    st.nextComp = waveTypes(1, st.rng);
+    refresh(st);
+    return st;
+  }
+
+  function score(st) { return st.wavesCleared * 100 + st.kills; }
+
+  function emit(st, ev) { if (st.fx) st.fx.push(ev); }
+
+  function makeCritter(st, type) {
+    var d = CRITTER[type], scale = Math.pow(HP_GROWTH, st.wave - 1);
+    var base = d.boss ? 40 + 30 * (Math.floor(st.wave / 5) - 1) : d.hp;
+    var field = d.mole ? 1 : 0;
+    var cr = {
+      id: st.nextId++, type: type, boss: !!d.boss,
+      hp: base * scale, maxHp: base * scale,
+      speed: d.speed, seeds: d.seeds, lives: d.boss ? 5 : 1,
+      armor: d.armor || 0, field: field,
+      from: ENTRANCE, to: -1, prog: 0,
+      slowT: 0, slowMul: 1, alive: true
+    };
+    cr.to = nextStep(st, ENTRANCE, field);
+    return cr;
+  }
+
+  // Test/debug helper: add a critter at a cell, walking toward the exit.
+  function spawnAt(st, type, idx, prog) {
+    var cr = makeCritter(st, type);
+    cr.from = idx;
+    cr.to = nextStep(st, idx, cr.field);
+    cr.prog = prog || 0;
+    st.critters.push(cr);
+    return cr;
+  }
+
+  function startWave(st) {
+    if (st.phase === 'over') return { ok: false, reason: 'Game over' };
+    if (st.phase === 'wave') return { ok: false, reason: 'Wave in progress' };
+    var bonus = isFinite(st.buildLeft) ? Math.max(0, Math.floor(st.buildLeft)) : 0; // +1 seed per remaining second
+    st.seeds += bonus;
+    st.wave++;
+    st.queue = st.nextComp;
+    st.nextComp = waveTypes(st.wave + 1, st.rng);
+    st.spawnT = 0;
+    st.phase = 'wave';
+    st.buildLeft = Infinity;
+    emit(st, { k: 'wave', n: st.wave, boss: st.queue.indexOf('badger') >= 0 });
+    return { ok: true, bonus: bonus };
+  }
+
+  function clearWave(st) {
+    st.wavesCleared++;
+    st.seeds += 8 + 2 * st.wave;
+    st.phase = 'build';
+    st.buildLeft = BUILD_TIME;
+    emit(st, { k: 'clear', n: st.wave });
+  }
+
+  /* ---------- combat ---------- */
+  function hit(st, cr, raw) {
+    var dmg = cr.armor > 0 ? Math.max(ARMOR_MIN_DMG, raw - cr.armor) : raw;
+    cr.hp -= dmg;
+    if (cr.hp <= 0 && cr.alive) {
+      cr.alive = false;
+      st.kills++;
+      st.seeds += cr.seeds;
+      var p = critterPos(cr);
+      emit(st, { k: 'kill', x: p.x, y: p.y, seeds: cr.seeds, boss: cr.boss });
+    }
+  }
+
+  function slow(cr, mul, dur) {
+    cr.slowMul = cr.slowT > 0 ? Math.min(cr.slowMul, mul) : mul;
+    cr.slowT = Math.max(cr.slowT, dur);
+  }
+
+  // Fires one gnome if it can. Returns true when a shot (or bell pulse) happened.
+  function fireGnome(st, idx) {
+    var g = st.gnome[idx], def = GNOME[g.type], lv = g.level - 1;
+    var c = cellCenter(idx), alive = [], k;
+    for (k = 0; k < st.critters.length; k++) if (st.critters[k].alive) alive.push(st.critters[k]);
+    if (g.type === 'bell') {
+      var rad = def.range[lv];
+      emit(st, { k: 'bell', x: c.x, y: c.y, r: rad });
+      for (k = 0; k < alive.length; k++) {
+        if (alive[k].alive && dist2(critterPos(alive[k]), c) <= rad) hit(st, alive[k], def.dmg[lv]);
+      }
+      return true;
+    }
+    var best = null, bestRem = Infinity, rng = def.range[lv];
+    for (k = 0; k < alive.length; k++) {
+      var cr = alive[k];
+      if (dist2(critterPos(cr), c) > rng) continue;
+      var rem = remaining(st, cr);
+      if (rem < bestRem || (rem === bestRem && cr.id < best.id)) { best = cr; bestRem = rem; }
+    }
+    if (!best) return false;
+    var bp = critterPos(best);
+    emit(st, { k: 'shot', type: g.type, x1: c.x, y1: c.y, x2: bp.x, y2: bp.y });
+    hit(st, best, def.dmg[lv]);
+    if (g.type === 'frost') {
+      slow(best, def.slow[lv], def.slowT);
+      if (g.level === 3) {
+        // Level 3 also slows the two nearest other critters within 2 cells of the target.
+        var near = alive.filter(function (o) { return o !== best && o.alive && dist2(critterPos(o), bp) <= 2; });
+        near.sort(function (a, b) { return dist2(critterPos(a), bp) - dist2(critterPos(b), bp); });
+        for (k = 0; k < Math.min(2, near.length); k++) slow(near[k], def.slow[lv], def.slowT);
+      }
+    }
+    return true;
+  }
+
+  /* ---------- simulation step ---------- */
+  function leak(st, cr) {
+    cr.alive = false;
+    st.lives -= cr.lives;
+    var p = cellCenter(EXIT);
+    emit(st, { k: 'leak', x: p.x, y: p.y, boss: cr.boss, n: cr.lives });
+  }
+
+  // Advances the game by dt seconds. Call with a fixed STEP for determinism.
+  function update(st, dt) {
+    if (st.phase === 'over') return;
+    st.time += dt;
+
+    if (st.phase === 'build') {
+      if (isFinite(st.buildLeft)) {
+        st.buildLeft -= dt;
+        if (st.buildLeft <= 0) { st.buildLeft = 0; startWave(st); }
+      }
+      return;
+    }
+
+    // Spawning.
+    if (st.queue.length) {
+      st.spawnT -= dt;
+      while (st.spawnT <= 0 && st.queue.length) {
+        st.critters.push(makeCritter(st, st.queue.shift()));
+        st.spawnT += SPAWN_GAP;
+      }
+    }
+
+    // Gnomes fire.
+    for (var i = 0; i < N; i++) {
+      var g = st.gnome[i];
+      if (!g) continue;
+      g.cd = Math.max(0, g.cd - dt);
+      if (g.cd === 0 && fireGnome(st, i)) g.cd = GNOME[g.type].rate;
+    }
+
+    // Critters move.
+    for (var k = 0; k < st.critters.length; k++) {
+      var cr = st.critters[k];
+      if (!cr.alive) continue;
+      if (cr.slowT > 0) {
+        cr.slowT -= dt;
+        if (cr.slowT <= 0) { cr.slowT = 0; cr.slowMul = 1; }
+      }
+      cr.prog += cr.speed * (cr.slowT > 0 ? cr.slowMul : 1) * dt;
+      while (cr.prog >= 1 && cr.alive) {
+        cr.prog -= 1;
+        cr.from = cr.to;
+        if (cr.from === EXIT) { leak(st, cr); break; }
+        cr.to = nextStep(st, cr.from, cr.field);
+        if (cr.to < 0) { st.stuck++; cr.to = cr.from; cr.prog = 0; break; }
+      }
+    }
+    st.critters = st.critters.filter(function (c) { return c.alive; });
+
+    if (st.lives <= 0) {
+      st.lives = 0;
+      st.phase = 'over';
+      emit(st, { k: 'over' });
+      return;
+    }
+    if (st.queue.length === 0 && st.critters.length === 0) clearWave(st);
+  }
+
+  /* ---------- player actions (validated; nothing changes when refused) ---------- */
+  function costOfTool(tool) {
+    if (tool === 'hedge') return HEDGE_COST;
+    if (tool === 'sell') return 0;
+    return GNOME[tool].cost;
+  }
+
+  // Describes what a tool would do on a cell. Never mutates the state.
+  // kind: 'hedge' | 'gnome' (on hedge) | 'gnome-auto' (+hedge) | 'upgrade' | 'sell-gnome' | 'sell-hedge' | 'none'
+  function plan(st, idx, tool) {
+    var P = { ok: false, kind: 'none', cost: 0, refund: 0, reason: '' };
+    if (st.phase === 'over') { P.reason = 'Game over'; return P; }
+    if (idx < 0 || idx >= N) { P.reason = 'Off board'; return P; }
+    var g = st.gnome[idx], h = st.hedge[idx];
+
+    if (tool === 'sell') {
+      if (g) {
+        P.ok = true; P.kind = 'sell-gnome';
+        P.refund = Math.floor(g.invested * SELL_NUM / SELL_DEN);
+      } else if (h > 0) {
+        P.ok = true; P.kind = 'sell-hedge';
+        // Hedges refund in full during the build phase, 70% otherwise.
+        P.refund = st.phase === 'build' ? h : Math.max(1, Math.floor(h * SELL_NUM / SELL_DEN));
+      } else {
+        P.reason = 'Nothing to sell';
+      }
+      return P;
+    }
+
+    if (idx === ENTRANCE || idx === EXIT) { P.reason = "Can't build here"; return P; }
+
+    if (tool === 'hedge') {
+      if (g) { P.reason = 'Gnome here'; return P; }
+      if (h > 0) { P.reason = 'Already hedged'; return P; }
+      P.kind = 'hedge'; P.cost = HEDGE_COST;
+    } else {
+      var def = GNOME[tool];
+      if (g) {
+        if (g.type !== tool) { P.reason = 'Occupied by ' + GNOME[g.type].name + ' gnome'; return P; }
+        if (g.level >= 3) { P.reason = 'Max level'; return P; }
+        P.kind = 'upgrade'; P.cost = def.up[g.level - 1];
+      } else if (h > 0) {
+        P.kind = 'gnome'; P.cost = def.cost;
+      } else {
+        P.kind = 'gnome-auto'; P.cost = def.cost + AUTO_HEDGE_COST;
+      }
+    }
+
+    if (P.kind !== 'upgrade' && isOccupied(st, idx)) { P.reason = 'Critter there'; P.kind = 'none'; return P; }
+    if (st.seeds < P.cost) { P.reason = 'Not enough seeds'; return P; }
+    if (P.kind === 'upgrade') { P.ok = true; return P; }
+
+    var ok;
+    if (P.kind === 'hedge') ok = layoutWith(st, idx, HEDGE_COST, st.gnome[idx]);
+    else if (P.kind === 'gnome') ok = layoutWith(st, idx, h, {});
+    else ok = layoutWith(st, idx, AUTO_HEDGE_COST, {});
+    if (!ok) { P.reason = 'Path blocked'; return P; }
+    P.ok = true;
+    return P;
+  }
+
+  // Validates and applies a tool on a cell. Returns the plan (ok tells whether it happened).
+  function act(st, idx, tool) {
+    var P = plan(st, idx, tool);
+    if (!P.ok) return P;
+    var def = tool !== 'hedge' && tool !== 'sell' ? GNOME[tool] : null;
+    switch (P.kind) {
+      case 'hedge':
+        st.hedge[idx] = HEDGE_COST;
+        st.seeds -= P.cost;
+        break;
+      case 'gnome':
+        st.gnome[idx] = { type: tool, level: 1, invested: def.cost, cd: 0 };
+        st.seeds -= P.cost;
+        break;
+      case 'gnome-auto':
+        st.hedge[idx] = AUTO_HEDGE_COST;
+        st.gnome[idx] = { type: tool, level: 1, invested: def.cost, cd: 0 };
+        st.seeds -= P.cost;
+        break;
+      case 'upgrade':
+        var g = st.gnome[idx];
+        g.invested += P.cost;
+        g.level++;
+        st.seeds -= P.cost;
+        break;
+      case 'sell-gnome':
+        st.gnome[idx] = null;
+        st.seeds += P.refund;
+        break;
+      case 'sell-hedge':
+        st.hedge[idx] = 0;
+        st.seeds += P.refund;
+        break;
+    }
+    refresh(st);
+    return P;
+  }
+
+  // Early call (or the timer ran out): start the next wave.
+  function nextWave(st) { return startWave(st); }
+
+  /* ---------- invariant check (used by tests) ---------- */
+  // Returns a list of problems; an empty list means the board is valid.
+  function problems(st) {
+    var out = [], d0 = bfs(st, 0), d1 = bfs(st, 1), k;
+    if (d0[ENTRANCE] < 0) out.push('entrance cut off from exit');
+    for (k = 0; k < st.critters.length; k++) {
+      var cr = st.critters[k];
+      if (!cr.alive) continue;
+      var d = cr.field ? d1 : d0;
+      if (d[cr.from] < 0 || (cr.to >= 0 && d[cr.to] < 0)) out.push('critter ' + cr.id + ' trapped');
+    }
+    return out;
+  }
+
+  return {
+    COLS: COLS, ROWS: ROWS, N: N, ENTRANCE: ENTRANCE, EXIT: EXIT, STEP: STEP, BUILD_TIME: BUILD_TIME,
+    START_SEEDS: START_SEEDS, START_LIVES: START_LIVES, HEDGE_COST: HEDGE_COST, AUTO_HEDGE_COST: AUTO_HEDGE_COST,
+    GNOME: GNOME, CRITTER: CRITTER, NB: NB,
+    newGame: newGame, plan: plan, act: act, nextWave: nextWave, startWave: startWave, update: update,
+    pathCells: pathCells, waveTypes: waveTypes, critterPos: critterPos, spawnAt: spawnAt,
+    refresh: refresh, bfs: bfs, problems: problems, costOfTool: costOfTool, remaining: remaining,
+    score: score, mulberry32: mulberry32, cellCenter: cellCenter, xy: xy, isOccupied: isOccupied
+  };
+})();
+</script>
+
+<script id="view">
+/* =====================================================================
+ * VIEW - canvas rendering, input, audio and juice. Reads HW, never edits rules.
+ * ===================================================================== */
+(function () {
+  'use strict';
+  var cv = document.getElementById('game');
+  var ctx = cv.getContext('2d');
+  var W = 0, H = 0, DPR = 1, L = null;
+  var TYPE_COLOR = { pebble: '#d43b3b', frost: '#3b7ad4', bell: '#e0b030' };
+  var TOOLS = ['hedge', 'pebble', 'frost', 'bell', 'sell'];
+  var TOOL_NAME = { hedge: 'Hedge', pebble: 'Pebble', frost: 'Frost', bell: 'Bell', sell: 'Sell' };
+  var TOOL_KEY = { Digit1: 'hedge', Digit2: 'pebble', Digit3: 'frost', Digit4: 'bell', KeyQ: 'sell' };
+  var MOVE = { ArrowLeft: [-1, 0], KeyA: [-1, 0], ArrowRight: [1, 0], KeyD: [1, 0], ArrowUp: [0, -1], KeyW: [0, -1], ArrowDown: [0, 1], KeyS: [0, 1] };
+  var MOVE_THROTTLE = 110;
+  var PANEL_W = 184, PANEL_H = 86;
+
+  // Game-wide view state.
+  var game = {
+    screen: 'title',     // 'title' | 'playing' | 'over'
+    paused: false,
+    sim: null,
+    speed: 1,
+    acc: 0,
+    tool: 'hedge',
+    cursor: 8 * HW.COLS + 5,
+    pending: -1,         // cell waiting for a confirming second tap
+    panel: -1,           // cell whose gnome panel is open
+    toast: null,         // {text, bad, t, life, prio}
+    toastQueue: [],      // toasts waiting behind the current one
+    overAt: 0,
+    newBest: false,
+    best: loadBest()
+  };
+  var fxLines = [], fxRings = [], floats = [], parts = [];
+  var shake = 0, flash = 0, time = 0, lastMoveAt = 0;
+
+  /* ---------- helpers ---------- */
+  // Singular/plural seed counts: "1 seed", "2 seeds".
+  function sd(n) { return n === 1 ? '1 seed' : n + ' seeds'; }
+
+  /* ---------- storage (best score; guarded) ---------- */
+  function loadBest() {
+    try {
+      var v = JSON.parse(localStorage.getItem('hedgewise.best'));
+      if (v && typeof v.wave === 'number' && typeof v.score === 'number') return v;
+    } catch (e) { /* storage blocked or corrupt */ }
+    return { wave: 0, score: 0 };
+  }
+  function saveBest() {
+    try { localStorage.setItem('hedgewise.best', JSON.stringify(game.best)); } catch (e) { /* ignore */ }
+  }
+
+  /* ---------- audio (created on first input; one-shot sounds only) ---------- */
+  var AC = null;
+  function unlockAudio() {
+    if (AC) return;
+    try {
+      var Ctor = window.AudioContext || window.webkitAudioContext;
+      if (Ctor) AC = new Ctor();
+    } catch (e) { AC = null; }
+  }
+  function tone(f, dur, type, vol, slideTo, delay) {
+    if (!AC) return;
+    try {
+      var t = AC.currentTime + (delay || 0);
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = type;
+      o.frequency.setValueAtTime(f, t);
+      if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t + dur);
+      g.gain.setValueAtTime(vol, t);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      o.connect(g); g.connect(AC.destination);
+      o.start(t); o.stop(t + dur + 0.02);
+    } catch (e) { /* audio failures are non-fatal */ }
+  }
+
+  /* ---------- layout (CSS px; canvas backing store = CSS px x DPR) ---------- */
+  function computeLayout(w, h) {
+    var l = { landscape: w > h, board: null, buttons: [], hud: null };
+    var i, cs, bw, aw;
+    if (!l.landscape) {
+      var HUD_H = 56, TB = 140;
+      var areaH = h - HUD_H - TB;
+      cs = Math.min((w - 16) / HW.COLS, (areaH - 16) / HW.ROWS);
+      l.board = { x: (w - cs * HW.COLS) / 2, y: HUD_H + (areaH - cs * HW.ROWS) / 2, cs: cs };
+      l.hud = { x: 0, y: 0, w: w, h: HUD_H };
+      bw = (w - 16 - 4 * 6) / 5;
+      for (i = 0; i < TOOLS.length; i++) {
+        l.buttons.push({ id: 'tool-' + TOOLS[i], tool: TOOLS[i], x: 8 + i * (bw + 6), y: h - TB + 8, w: bw, h: 54 });
+      }
+      aw = (w - 16 - 12);
+      l.buttons.push({ id: 'next', x: 8, y: h - TB + 70, w: aw * 0.5, h: 44 });
+      l.buttons.push({ id: 'speed', x: 8 + aw * 0.5 + 6, y: h - TB + 70, w: aw * 0.25, h: 44 });
+      l.buttons.push({ id: 'pause', x: 8 + aw * 0.75 + 12, y: h - TB + 70, w: aw * 0.25, h: 44 });
+    } else {
+      var SB = Math.max(170, Math.min(230, w * 0.3));
+      var areaW = w - SB;
+      cs = Math.min((areaW - 16) / HW.COLS, (h - 16) / HW.ROWS);
+      l.board = { x: (areaW - cs * HW.COLS) / 2, y: (h - cs * HW.ROWS) / 2, cs: cs };
+      l.hud = { x: w - SB, y: 0, w: SB, h: 126 };
+      bw = (SB - 16 - 6) / 2;
+      for (i = 0; i < TOOLS.length; i++) {
+        l.buttons.push({ id: 'tool-' + TOOLS[i], tool: TOOLS[i], x: w - SB + 8 + (i % 2) * (bw + 6), y: 132 + Math.floor(i / 2) * 50, w: bw, h: 44 });
+      }
+      aw = (SB - 16 - 12) / 3;
+      var ay = 132 + 3 * 50 + 6;
+      l.buttons.push({ id: 'next', x: w - SB + 8, y: ay, w: aw, h: 44 });
+      l.buttons.push({ id: 'speed', x: w - SB + 8 + aw + 6, y: ay, w: aw, h: 44 });
+      l.buttons.push({ id: 'pause', x: w - SB + 8 + 2 * (aw + 6), y: ay, w: aw, h: 44 });
+    }
+    return l;
+  }
+
+  function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    DPR = window.devicePixelRatio || 1;
+    cv.style.width = W + 'px';
+    cv.style.height = H + 'px';
+    cv.width = Math.round(W * DPR);
+    cv.height = Math.round(H * DPR);
+    L = computeLayout(W, H);
+  }
+
+  function cellAt(x, y) {
+    var b = L.board;
+    var c = Math.floor((x - b.x) / b.cs), r = Math.floor((y - b.y) / b.cs);
+    if (c < 0 || r < 0 || c >= HW.COLS || r >= HW.ROWS) return -1;
+    return r * HW.COLS + c;
+  }
+  function buttonAt(x, y) {
+    for (var i = 0; i < L.buttons.length; i++) {
+      var b = L.buttons[i];
+      if (x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) return b;
+    }
+    return null;
+  }
+
+  /* ---------- gnome panel geometry ---------- */
+  // Panel sits next to the gnome cell, above it when there is room, clamped on screen.
+  function panelRect(idx) {
+    var b = L.board, c = HW.xy(idx), cx = b.x + (c.c + 0.5) * b.cs, cy = b.y + (c.r + 0.5) * b.cs;
+    var x = Math.max(4, Math.min(W - PANEL_W - 4, cx - PANEL_W / 2));
+    var above = c.r > 4 && cy - b.cs / 2 - PANEL_H - 8 >= 4;   // rows 0-4: always below, never over the entrance rows
+    var y = above ? cy - b.cs / 2 - PANEL_H - 8 : Math.min(H - PANEL_H - 4, cy + b.cs / 2 + 8);
+    return {
+      x: x, y: y, w: PANEL_W, h: PANEL_H,
+      up: { x: x + 10, y: y + 38, w: 80, h: 38 },
+      sell: { x: x + PANEL_W - 90, y: y + 38, w: 80, h: 38 },
+      close: { x: x + PANEL_W - 28, y: y + 4, w: 24, h: 24 }
+    };
+  }
+  function inRect(r, x, y) { return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h; }
+  function upgradeInfo(g) {
+    if (g.level >= 3) return { cost: 0, max: true };
+    return { cost: HW.GNOME[g.type].up[g.level - 1], max: false };
+  }
+  function closePanel() { game.panel = -1; }
+
+  /* ---------- game flow ---------- */
+  // Toasts show one at a time. A priority toast (the wave-7 mole warning) cannot be overwritten
+  // while it runs; other toasts queue behind it, and so do toasts that arrive while another is showing.
+  function toastActive() { return !!game.toast && game.toast.t < game.toast.life; }
+  function setToast(t, bad, life, prio) {
+    var item = { text: t, bad: !!bad, t: 0, life: life || 2.2, prio: !!prio };
+    if (toastActive() && (game.toast.prio || !prio)) {
+      game.toastQueue.push(item);
+      if (game.toastQueue.length > 4) game.toastQueue.shift();   // keep the newest few
+      return;
+    }
+    game.toast = item;
+  }
+
+  function startRun() {
+    game.sim = HW.newGame(((Math.random() * 2147483646) | 0) + 1);
+    game.sim.fx = [];
+    game.screen = 'playing';
+    game.paused = false;
+    game.speed = 1;
+    game.acc = 0;
+    game.tool = 'hedge';
+    game.cursor = 8 * HW.COLS + 5;
+    game.pending = -1;
+    game.panel = -1;
+    game.toast = null;
+    game.toastQueue = [];
+    game.newBest = false;
+    fxLines = []; fxRings = []; floats = []; parts = [];
+    shake = 0; flash = 0;
+  }
+
+  function pause() {
+    if (game.screen !== 'playing' || game.sim.phase === 'over') return;
+    game.paused = true;
+    game.pending = -1;
+    closePanel();
+  }
+  function resume() { if (game.screen === 'playing') game.paused = false; }
+
+  function doAct(idx) {
+    var P = HW.act(game.sim, idx, game.tool);
+    if (P.ok) {
+      if (P.kind === 'sell-gnome') setToast('Sold gnome for ' + sd(P.refund));
+      else if (P.kind === 'sell-hedge') setToast('Sold hedge for ' + sd(P.refund));
+      else if (P.kind === 'upgrade') setToast('Upgraded, -' + sd(P.cost));
+      else { setToast(TOOL_NAME[game.tool] + ' placed, -' + sd(P.cost)); tone(480, 0.06, 'sine', 0.04, 620); }
+    } else {
+      setToast(P.reason, true);
+    }
+    game.pending = -1;
+    return P;
+  }
+
+  // Actions from the gnome panel act on that gnome directly, whatever tool is selected.
+  function panelUpgrade(idx) {
+    var g = game.sim.gnome[idx];
+    if (!g) { closePanel(); return; }
+    var info = upgradeInfo(g);
+    if (info.max) { setToast('Already max level', true); return; }
+    var P = HW.act(game.sim, idx, g.type);
+    if (P.ok) { setToast('Upgraded to level ' + g.level + ', -' + sd(P.cost)); tone(660, 0.1, 'triangle', 0.05, 990); }
+    else setToast(P.reason, true);
+  }
+  function panelSell(idx) {
+    var P = HW.act(game.sim, idx, 'sell');
+    if (P.ok) setToast('Sold for ' + sd(P.refund));
+    else setToast(P.reason, true);
+    if (!game.sim.gnome[idx]) closePanel();
+  }
+
+  function doNextWave() {
+    var r = HW.nextWave(game.sim);
+    if (r.ok) {
+      game.pending = -1;
+      closePanel();
+      if (r.bonus > 0) setToast('Early call +' + sd(r.bonus));
+    } else {
+      setToast(r.reason, true);
+    }
+  }
+
+  function onButton(b) {
+    if (b.tool) { game.tool = b.tool; game.pending = -1; return; }
+    if (b.id === 'next') doNextWave();
+    else if (b.id === 'speed') game.speed = game.speed === 1 ? 2 : 1;
+    else if (b.id === 'pause') pause();
+  }
+
+  // Tapping a gnome (any tool) opens its panel. Empty cells use the tap-to-confirm ghost.
+  function onBoardTap(idx) {
+    game.cursor = idx;
+    if (game.sim.gnome[idx]) { game.panel = idx; game.pending = -1; return; }
+    closePanel();
+    if (game.pending === idx) { doAct(idx); return; }
+    game.pending = idx;
+  }
+
+  function tapAt(x, y) {
+    if (game.screen === 'title') { startRun(); return; }
+    if (game.screen === 'over') { if (performance.now() - game.overAt > 600) startRun(); return; }
+    if (game.paused) { resume(); return; }
+    if (game.panel >= 0 && game.sim.gnome[game.panel]) {
+      var pr = panelRect(game.panel);
+      if (inRect(pr.close, x, y)) { closePanel(); return; }
+      if (inRect(pr.up, x, y)) { panelUpgrade(game.panel); return; }
+      if (inRect(pr.sell, x, y)) { panelSell(game.panel); return; }
+      if (inRect(pr, x, y)) return;   // tap inside the panel body does nothing
+    }
+    closePanel();                     // tapping elsewhere closes the panel
+    var b = buttonAt(x, y);
+    if (b) { onButton(b); return; }
+    var idx = cellAt(x, y);
+    if (idx >= 0) onBoardTap(idx);
+    else game.pending = -1;
+  }
+
+  /* ---------- input ---------- */
+  cv.addEventListener('pointerdown', function (e) {
+    e.preventDefault();
+    unlockAudio();
+    var r = cv.getBoundingClientRect();
+    tapAt(e.clientX - r.left, e.clientY - r.top);
+  });
+
+  window.addEventListener('keydown', function (e) {
+    unlockAudio();
+    var k = e.code;
+    if (game.screen === 'title') {
+      if (k === 'Enter' || k === 'Space') { e.preventDefault(); if (!e.repeat) startRun(); }
+      return;
+    }
+    if (game.screen === 'over') {
+      if (k === 'Enter' || k === 'Space' || k === 'KeyR') { e.preventDefault(); if (!e.repeat && performance.now() - game.overAt > 600) startRun(); }
+      return;
+    }
+    if (game.paused) {
+      if (k === 'KeyP' || k === 'Escape' || k === 'Enter' || k === 'Space') { e.preventDefault(); if (!e.repeat) resume(); }
+      return;
+    }
+    // Gnome panel is open: Esc closes it, X sells, Space/Enter upgrades the gnome under the cursor.
+    if (game.panel >= 0 && game.sim.gnome[game.panel]) {
+      if (k === 'Escape') { e.preventDefault(); if (!e.repeat) closePanel(); return; }
+      if (k === 'KeyX') { e.preventDefault(); if (!e.repeat) panelSell(game.panel); return; }
+      if ((k === 'Space' || k === 'Enter') && game.cursor === game.panel) { e.preventDefault(); if (!e.repeat) panelUpgrade(game.panel); return; }
+    }
+    if (TOOL_KEY[k]) { game.tool = TOOL_KEY[k]; game.pending = -1; return; }
+    if (MOVE[k]) {
+      e.preventDefault();
+      var now = performance.now();
+      if (e.repeat && now - lastMoveAt < MOVE_THROTTLE) return; // throttled key-repeat
+      lastMoveAt = now;
+      var c = game.cursor % HW.COLS, r2 = Math.floor(game.cursor / HW.COLS);
+      c = Math.max(0, Math.min(HW.COLS - 1, c + MOVE[k][0]));
+      r2 = Math.max(0, Math.min(HW.ROWS - 1, r2 + MOVE[k][1]));
+      game.cursor = r2 * HW.COLS + c;
+      game.pending = -1;
+      closePanel();
+      return;
+    }
+    if (k === 'Space' || k === 'Enter') {
+      e.preventDefault();
+      if (e.repeat) return;
+      if (game.sim.gnome[game.cursor]) { game.panel = game.cursor; game.pending = -1; }
+      else { closePanel(); doAct(game.cursor); }
+      return;
+    }
+    if (k === 'KeyN') { if (!e.repeat) doNextWave(); return; }
+    if (k === 'KeyF') { if (!e.repeat) game.speed = game.speed === 1 ? 2 : 1; return; }
+    if (k === 'KeyP' || k === 'Escape') { if (!e.repeat) pause(); e.preventDefault(); }
+  });
+
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) pause();
+  });
+  window.addEventListener('blur', pause);
+  window.addEventListener('resize', resize);
+  window.addEventListener('orientationchange', resize);
+
+  /* ---------- sim events -> juice ---------- */
+  function burst(x, y, color, n) {
+    for (var i = 0; i < n; i++) {
+      var a = Math.random() * Math.PI * 2, s = 1.5 + Math.random() * 2.5;
+      parts.push({ x: x, y: y, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 1, t: 0, life: 0.6 + Math.random() * 0.3, color: color });
+    }
+  }
+
+  function processEvents() {
+    var ev = game.sim.fx;
+    for (var i = 0; i < ev.length; i++) {
+      var e = ev[i];
+      if (e.k === 'shot') {
+        fxLines.push({ x1: e.x1, y1: e.y1, x2: e.x2, y2: e.y2, t: 0, life: 0.14, color: TYPE_COLOR[e.type] || '#fff' });
+        if (e.type === 'pebble') tone(900, 0.04, 'square', 0.015, 600);
+        else if (e.type === 'frost') tone(1400, 0.08, 'sine', 0.02, 2000);
+      } else if (e.k === 'bell') {
+        fxRings.push({ x: e.x, y: e.y, r: e.r, t: 0, life: 0.45 });
+        tone(660, 0.25, 'sine', 0.05, 990);
+        shake = Math.max(shake, 1.5);
+      } else if (e.k === 'kill') {
+        floats.push({ x: e.x, y: e.y, text: '+' + e.seeds, t: 0, life: 0.9 });
+        burst(e.x, e.y, '#8fd16a', e.boss ? 24 : 7);
+        tone(520, 0.06, 'triangle', 0.05, 780);
+      } else if (e.k === 'leak') {
+        flash = 0.35;
+        shake = Math.max(shake, e.boss ? 6 : 3);
+        burst(e.x, e.y, '#ff6a5a', 10);
+        floats.push({ x: e.x, y: e.y - 0.3, text: '-' + e.n, t: 0, life: 1, bad: true });
+        tone(90, 0.25, 'sine', 0.25, 45);
+      } else if (e.k === 'wave') {
+        if (e.boss) { tone(196, 0.5, 'square', 0.06); tone(147, 0.7, 'square', 0.06, null, 0.25); shake = Math.max(shake, 4); }
+        else { tone(440, 0.15, 'square', 0.04); tone(554, 0.2, 'square', 0.04, null, 0.15); }
+        closePanel();                  // the gnome panel closes when a wave starts
+        if (e.n === 7) setToast('Moles tunnel under hedges — guard the straight line!', false, 4.5, true);
+      } else if (e.k === 'clear') {
+        tone(523, 0.12, 'triangle', 0.05); tone(784, 0.2, 'triangle', 0.05, null, 0.12);
+        setToast('Wave ' + e.n + ' cleared');
+      } else if (e.k === 'over') {
+        tone(330, 0.3, 'triangle', 0.08); tone(220, 0.5, 'triangle', 0.08, null, 0.3);
+      }
+    }
+    game.sim.fx.length = 0;
+  }
+
+  function endRunIfOver() {
+    var s = game.sim;
+    if (game.screen === 'playing' && s.phase === 'over') {
+      game.screen = 'over';
+      game.paused = false;
+      closePanel();
+      game.overAt = performance.now();
+      var sc = HW.score(s);
+      game.newBest = s.wave > game.best.wave || sc > game.best.score;
+      if (s.wave > game.best.wave) game.best.wave = s.wave;
+      if (sc > game.best.score) game.best.score = sc;
+      saveBest();
+    }
+  }
+
+  /* ---------- update ---------- */
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min(0.05, Math.max(0, (now - last) / 1000));
+    last = now;
+    time += dt;
+    if (game.screen === 'playing' && !game.paused) {
+      game.acc += dt * game.speed;
+      var steps = 0;
+      while (game.acc >= HW.STEP && steps < 40) {
+        HW.update(game.sim, HW.STEP);
+        game.acc -= HW.STEP;
+        steps++;
+      }
+      if (steps === 40) game.acc = 0;
+      processEvents();
+      endRunIfOver();
+    }
+    if (game.toast) {
+      game.toast.t += dt;
+      if (game.toast.t >= game.toast.life) game.toast = game.toastQueue.shift() || null;
+    }
+    stepFx(dt);
+    render();
+    window.__game.state = game.screen === 'playing' && game.paused ? 'paused' : game.screen;
+    window.__game.score = game.sim ? HW.score(game.sim) : 0;
+    requestAnimationFrame(frame);
+  }
+
+  function stepFx(dt) {
+    fxLines.forEach(function (f) { f.t += dt; });
+    fxLines = fxLines.filter(function (f) { return f.t < f.life; });
+    fxRings.forEach(function (f) { f.t += dt; });
+    fxRings = fxRings.filter(function (f) { return f.t < f.life; });
+    floats.forEach(function (f) { f.t += dt; });
+    floats = floats.filter(function (f) { return f.t < f.life; });
+    parts.forEach(function (p) { p.t += dt; p.x += p.vx * dt * 0.6; p.y += p.vy * dt * 0.6; p.vy += 6 * dt; });
+    parts = parts.filter(function (p) { return p.t < p.life; });
+    shake = Math.max(0, shake - dt * 18);
+    flash = Math.max(0, flash - dt);
+  }
+
+  /* ---------- drawing helpers ---------- */
+  function rr(x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+  function text(str, x, y, size, color, align, weight) {
+    ctx.fillStyle = color;
+    ctx.font = (weight || '600') + ' ' + size + 'px system-ui, -apple-system, Segoe UI, sans-serif';
+    ctx.textAlign = align || 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(str, x, y);
+  }
+  // Shrinks the font until the string fits maxW (never below 10px).
+  function fitText(str, x, y, maxW, size, color, align, weight) {
+    var s = size;
+    ctx.font = (weight || '600') + ' ' + s + 'px system-ui, -apple-system, Segoe UI, sans-serif';
+    while (s > 10 && ctx.measureText(str).width > maxW) { s--; ctx.font = (weight || '600') + ' ' + s + 'px system-ui, -apple-system, Segoe UI, sans-serif'; }
+    text(str, x, y, s, color, align, weight);
+  }
+
+  function drawHedge(x, y, cs) {
+    rr(x + 1, y + 1, cs - 2, cs - 2, cs * 0.3);
+    ctx.fillStyle = '#2f6b3a';
+    ctx.fill();
+    ctx.fillStyle = '#3d8448';
+    [[0.3, 0.3], [0.7, 0.3], [0.5, 0.62], [0.25, 0.7], [0.75, 0.7]].forEach(function (p) {
+      ctx.beginPath();
+      ctx.arc(x + cs * p[0], y + cs * p[1], cs * 0.16, 0, Math.PI * 2);
+      ctx.fill();
+    });
+  }
+
+  function drawGnome(g, x, y, cs) {
+    var cx = x + cs / 2, cy = y + cs / 2;
+    var glow = ctx.createRadialGradient(cx, cy, 0, cx, cy, cs * 0.95);
+    glow.addColorStop(0, 'rgba(255,210,120,0.38)');
+    glow.addColorStop(1, 'rgba(255,210,120,0)');
+    ctx.fillStyle = glow;
+    ctx.fillRect(cx - cs, cy - cs, cs * 2, cs * 2);
+    var s = cs * 0.22;
+    ctx.fillStyle = '#efe3c8';
+    ctx.beginPath(); ctx.ellipse(cx, cy + cs * 0.12, s, s * 1.15, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = TYPE_COLOR[g.type];
+    ctx.beginPath();
+    ctx.moveTo(cx, cy - cs * 0.4);
+    ctx.lineTo(cx - s * 1.05, cy - cs * 0.02);
+    ctx.lineTo(cx + s * 1.05, cy - cs * 0.02);
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = '#fff3c4';
+    for (var p = 0; p < g.level; p++) {
+      ctx.beginPath(); ctx.arc(cx - s * 0.6 + p * s * 0.6, y + cs * 0.9, cs * 0.05, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+
+  function drawCritter(cr, b) {
+    var p = HW.critterPos(cr);
+    var cs = b.cs, s = cs * (cr.boss ? 0.5 : 0.34);
+    var x = b.x + p.x * cs, y = b.y + p.y * cs + Math.sin(time * 12 + cr.id) * cs * 0.03;
+    ctx.save();
+    ctx.translate(x, y);
+    switch (cr.type) {
+      case 'slug':
+        ctx.fillStyle = '#9ccf6e';
+        ctx.beginPath(); ctx.ellipse(0, 0, s * 1.1, s * 0.6, 0, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(s * 0.7, -s * 0.35, s * 0.18, 0, Math.PI * 2); ctx.fill();
+        break;
+      case 'beetle':
+        ctx.fillStyle = '#6b4a2a';
+        ctx.beginPath(); ctx.ellipse(0, 0, s * 0.95, s * 0.8, 0, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = '#3d2a18';
+        ctx.beginPath(); ctx.arc(-s * 0.3, -s * 0.2, s * 0.2, 0, Math.PI * 2); ctx.arc(s * 0.3, s * 0.15, s * 0.16, 0, Math.PI * 2); ctx.fill();
+        break;
+      case 'hare':
+        ctx.fillStyle = '#e6dccb';
+        ctx.beginPath(); ctx.ellipse(0, 0, s * 0.85, s * 0.6, 0, 0, Math.PI * 2); ctx.fill();
+        ctx.beginPath(); ctx.ellipse(-s * 0.2, -s * 0.9, s * 0.14, s * 0.5, 0, 0, Math.PI * 2); ctx.fill();
+        ctx.beginPath(); ctx.ellipse(s * 0.1, -s * 0.9, s * 0.14, s * 0.5, 0, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = '#222'; ctx.beginPath(); ctx.arc(s * 0.5, -s * 0.15, s * 0.12, 0, Math.PI * 2); ctx.fill();
+        break;
+      case 'mole':
+        ctx.fillStyle = '#5b4032';
+        ctx.beginPath(); ctx.arc(0, 0, s * 0.85, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = '#e88f9a'; ctx.beginPath(); ctx.arc(s * 0.75, s * 0.1, s * 0.25, 0, Math.PI * 2); ctx.fill();
+        break;
+      default: // badger
+        ctx.fillStyle = '#e4e0d6';
+        rr(-s * 1.1, -s * 0.8, s * 2.2, s * 1.6, s * 0.5); ctx.fill();
+        ctx.fillStyle = '#222';
+        ctx.fillRect(-s * 0.3, -s * 0.8, s * 0.6, s * 1.6);
+        ctx.fillStyle = '#c33'; ctx.beginPath(); ctx.arc(s * 0.6, -s * 0.2, s * 0.12, 0, Math.PI * 2); ctx.fill();
+    }
+    if (cr.slowT > 0) {
+      ctx.strokeStyle = 'rgba(160,230,255,0.8)'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(0, 0, s * 1.3, 0, Math.PI * 2); ctx.stroke();
+    }
+    if (cr.hp < cr.maxHp) {
+      var bw = cs * 0.6, frac = Math.max(0, cr.hp / cr.maxHp);
+      ctx.fillStyle = 'rgba(0,0,0,0.5)'; ctx.fillRect(-bw / 2, -s - cs * 0.22, bw, 4);
+      ctx.fillStyle = '#7ddc6a'; ctx.fillRect(-bw / 2, -s - cs * 0.22, bw * frac, 4);
+    }
+    ctx.restore();
+  }
+
+  function drawBoard() {
+    var b = L.board, cs = b.cs, s = game.sim, r, c, i;
+    ctx.fillStyle = '#0b1410';
+    ctx.fillRect(b.x - 6, b.y - 6, cs * HW.COLS + 12, cs * HW.ROWS + 12);
+    for (r = 0; r < HW.ROWS; r++) {
+      for (c = 0; c < HW.COLS; c++) {
+        ctx.fillStyle = (r + c) % 2 ? '#1b2e24' : '#12201a';
+        ctx.fillRect(b.x + c * cs, b.y + r * cs, cs + 0.5, cs + 0.5);
+      }
+    }
+    // Entrance (lantern-lit) and exit (pond).
+    var en = HW.xy(HW.ENTRANCE), ex = HW.xy(HW.EXIT);
+    ctx.fillStyle = 'rgba(255,220,130,0.22)';
+    ctx.fillRect(b.x + en.c * cs, b.y + en.r * cs, cs, cs);
+    ctx.fillStyle = '#0d2a33';
+    ctx.beginPath(); ctx.arc(b.x + (ex.c + 0.5) * cs, b.y + (ex.r + 0.5) * cs, cs * 0.42, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = 'rgba(120,200,230,0.5)'; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(b.x + (ex.c + 0.5) * cs, b.y + (ex.r + 0.5) * cs, cs * 0.28 + Math.sin(time * 3) * 1.5, 0, Math.PI * 2); ctx.stroke();
+
+    // Hedges.
+    for (i = 0; i < HW.N; i++) {
+      if (s.hedge[i] > 0) drawHedge(b.x + (i % HW.COLS) * cs, b.y + Math.floor(i / HW.COLS) * cs, cs);
+    }
+    // Faint path dots (brighter while building).
+    var path = HW.pathCells(s), pa = s.phase === 'build' ? 0.35 : 0.15;
+    ctx.fillStyle = 'rgba(207,233,176,' + pa + ')';
+    for (i = 0; i < path.length; i++) {
+      var pc = HW.cellCenter(path[i]);
+      ctx.beginPath(); ctx.arc(b.x + pc.x * cs, b.y + pc.y * cs, cs * 0.07, 0, Math.PI * 2); ctx.fill();
+    }
+    // Critters.
+    for (i = 0; i < s.critters.length; i++) if (s.critters[i].alive) drawCritter(s.critters[i], b);
+    // Gnomes.
+    for (i = 0; i < HW.N; i++) {
+      if (s.gnome[i]) drawGnome(s.gnome[i], b.x + (i % HW.COLS) * cs, b.y + Math.floor(i / HW.COLS) * cs, cs);
+    }
+    // Effects: shots, bell rings, kill bursts, floating numbers.
+    fxLines.forEach(function (f) {
+      ctx.strokeStyle = f.color; ctx.globalAlpha = 1 - f.t / f.life; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(b.x + f.x1 * cs, b.y + f.y1 * cs); ctx.lineTo(b.x + f.x2 * cs, b.y + f.y2 * cs); ctx.stroke();
+    });
+    fxRings.forEach(function (f) {
+      var k = f.t / f.life;
+      ctx.strokeStyle = 'rgba(255,230,140,' + (1 - k) + ')'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(b.x + f.x * cs, b.y + f.y * cs, f.r * cs * k, 0, Math.PI * 2); ctx.stroke();
+    });
+    parts.forEach(function (p) {
+      ctx.globalAlpha = 1 - p.t / p.life; ctx.fillStyle = p.color;
+      ctx.beginPath(); ctx.arc(b.x + p.x * cs, b.y + p.y * cs, cs * 0.07, 0, Math.PI * 2); ctx.fill();
+    });
+    floats.forEach(function (f) {
+      ctx.globalAlpha = 1 - f.t / f.life;
+      text(f.text, b.x + f.x * cs, b.y + (f.y - f.t * 0.9) * cs, Math.round(cs * 0.45), f.bad ? '#ff8a7a' : '#ffe38a', 'center', '700');
+    });
+    ctx.globalAlpha = 1;
+
+    // Cursor, selected-gnome range ring, and the confirm ghost.
+    var gi = game.pending >= 0 ? game.pending : game.cursor;
+    var gc = HW.xy(gi);
+    var ringDef = null, ringR = 0;
+    if (s.gnome[gi]) { ringDef = HW.GNOME[s.gnome[gi].type]; ringR = ringDef.range[s.gnome[gi].level - 1]; }
+    else if (HW.GNOME[game.tool]) { ringDef = HW.GNOME[game.tool]; ringR = ringDef.range[0]; }
+    if (ringDef && s.phase !== 'over') {
+      ctx.strokeStyle = 'rgba(255,240,180,0.45)'; ctx.setLineDash([4, 4]); ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.arc(b.x + (gc.c + 0.5) * cs, b.y + (gc.r + 0.5) * cs, ringR * cs, 0, Math.PI * 2); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    if (game.screen === 'playing' && game.pending >= 0) {
+      var P = HW.plan(s, gi, game.tool);
+      ctx.fillStyle = P.ok ? 'rgba(120,230,140,0.35)' : 'rgba(235,70,70,0.45)';
+      ctx.fillRect(b.x + gc.c * cs, b.y + gc.r * cs, cs, cs);
+    }
+    if (game.screen === 'playing') {
+      ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2;
+      rr(b.x + gc.c * cs + 1.5, b.y + gc.r * cs + 1.5, cs - 3, cs - 3, cs * 0.2); ctx.stroke();
+    }
+    // Screen flash on a leaked critter.
+    if (flash > 0) {
+      ctx.fillStyle = 'rgba(255,60,50,' + flash * 0.5 + ')';
+      ctx.fillRect(b.x, b.y, cs * HW.COLS, cs * HW.ROWS);
+    }
+  }
+
+  // Gnome panel: level, Upgrade (N), Sell (M), close. Drawn over the board next to its gnome.
+  function drawGnomePanel() {
+    var s = game.sim;
+    if (game.screen !== 'playing' || game.paused || game.panel < 0 || !s.gnome[game.panel]) return;
+    var g = s.gnome[game.panel], d = HW.GNOME[g.type], pr = panelRect(game.panel);
+    var info = upgradeInfo(g), sell = Math.floor(g.invested * 0.7);
+    ctx.fillStyle = 'rgba(18,34,26,0.97)';
+    rr(pr.x, pr.y, pr.w, pr.h, 12); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,227,138,0.6)'; ctx.lineWidth = 1.5; ctx.stroke();
+    ctx.fillStyle = TYPE_COLOR[g.type]; ctx.beginPath(); ctx.arc(pr.x + 17, pr.y + 19, 5, 0, Math.PI * 2); ctx.fill();
+    text(d.name + ' gnome \u00b7 Lv ' + g.level, pr.x + 28, pr.y + 19, 13, '#f4f0d8', 'left', '700');
+    // close button
+    ctx.fillStyle = 'rgba(255,255,255,0.08)'; rr(pr.close.x, pr.close.y, pr.close.w, pr.close.h, 6); ctx.fill();
+    text('×', pr.close.x + pr.close.w / 2, pr.close.y + pr.close.h / 2 + 1, 16, '#f4f0d8', 'center', '700');
+    // upgrade button
+    var canUp = !info.max && s.seeds >= info.cost;
+    ctx.globalAlpha = canUp ? 1 : 0.45;
+    ctx.fillStyle = '#355c42'; rr(pr.up.x, pr.up.y, pr.up.w, pr.up.h, 8); ctx.fill();
+    text(info.max ? 'Max' : 'Upgrade', pr.up.x + pr.up.w / 2, pr.up.y + 13, 12, '#f4f0d8', 'center', '700');
+    text(info.max ? 'level 3' : '(' + info.cost + ')', pr.up.x + pr.up.w / 2, pr.up.y + 27, 12, '#ffe38a', 'center', '600');
+    ctx.globalAlpha = 1;
+    // sell button
+    ctx.fillStyle = '#4a3a2a'; rr(pr.sell.x, pr.sell.y, pr.sell.w, pr.sell.h, 8); ctx.fill();
+    text('Sell', pr.sell.x + pr.sell.w / 2, pr.sell.y + 13, 12, '#f4f0d8', 'center', '700');
+    text('(' + sell + ')', pr.sell.x + pr.sell.w / 2, pr.sell.y + 27, 12, '#ffe38a', 'center', '600');
+  }
+
+  function drawChip(type, count, x, y) {
+    var col = { slug: '#9ccf6e', beetle: '#8a5f36', hare: '#e6dccb', mole: '#7a5a48', badger: '#e4e0d6' }[type];
+    ctx.fillStyle = col;
+    ctx.beginPath(); ctx.arc(x, y, 9, 0, Math.PI * 2); ctx.fill();
+    text(String(count), x + 13, y, 12, '#e8f4e8', 'left', '700');
+  }
+
+  // Status line inside the HUD strip: toast > pending preview > wave status.
+  function hudLine(x, y, maxW) {
+    var s = game.sim;
+    if (game.toast) {
+      fitText(game.toast.text, x, y, maxW, 13, game.toast.bad ? '#ff9a8a' : '#f4f0d8', 'left', '600');
+      return true;
+    }
+    if (game.pending >= 0 && game.screen === 'playing') {
+      var P = HW.plan(s, game.pending, game.tool);
+      var t = P.ok ? 'Tap again to ' + (P.kind.indexOf('sell') === 0 ? 'sell' : P.kind === 'upgrade' ? 'upgrade' : 'build') + (P.cost ? ' (' + sd(P.cost) + ')' : '') : P.reason;
+      fitText(t, x, y, maxW, 12, P.ok ? '#bff5c8' : '#ff9a8a', 'left', '600');
+      return true;
+    }
+    return false;
+  }
+
+  function drawHUD() {
+    var h = L.hud, s = game.sim, sb = s || { seeds: 0, lives: 0, wave: 0, phase: 'build', buildLeft: Infinity, nextComp: [] };
+    ctx.fillStyle = 'rgba(8,18,13,0.88)';
+    ctx.fillRect(h.x, h.y, h.w, h.h);
+    var status;
+    if (sb.phase === 'over') status = 'Overrun';
+    else if (sb.phase === 'wave') status = 'Wave ' + sb.wave + ' in progress';
+    else if (!isFinite(sb.buildLeft)) status = 'Build, then press Next';
+    else status = 'Next wave in ' + Math.ceil(sb.buildLeft) + 's';
+    var counts = {};
+    (sb.nextComp || []).forEach(function (t) { counts[t] = (counts[t] || 0) + 1; });
+    var order = ['slug', 'beetle', 'hare', 'mole', 'badger'];
+    var px, py, lineY, lineW;
+    if (!L.landscape) {
+      text('Seeds ' + sb.seeds, 12, 16, 17, '#ffe38a');
+      text('Lives ' + sb.lives, h.w / 2, 16, 17, '#ffb0a0', 'center');
+      text('Wave ' + sb.wave, h.w - 12, 16, 17, '#d8f0d8', 'right');
+      lineY = 40; lineW = h.w - 24;
+      px = h.w * 0.62; py = 40;
+      if (!game.toast) text('Next', px - 16, py, 11, '#7fa58a', 'right', '500');
+    } else {
+      text('Seeds ' + sb.seeds, h.x + 12, 18, 17, '#ffe38a');
+      text('Lives ' + sb.lives, h.x + 12, 40, 16, '#ffb0a0');
+      text('Wave ' + sb.wave, h.x + 12, 61, 16, '#d8f0d8');
+      lineY = 84; lineW = h.w - 24;
+      px = h.x + 14; py = 108;
+      if (!game.toast) text('Next waves', h.x + 12, 96, 11, '#7fa58a', 'left', '500');
+    }
+    // Toast / preview take the status line; otherwise show the wave status.
+    var textShown = hudLine(L.landscape ? h.x + 12 : 12, lineY, L.landscape ? lineW : (px - 22));
+    if (!textShown) {
+      if (L.landscape) text(status, h.x + 12, lineY, 12, '#b9d6c0');
+      else fitText(status, 12, lineY, px - 22, 12, '#b9d6c0', 'left', '600');
+    }
+    if (game.toast) return;
+    // Next-wave preview chips.
+    var any = false;
+    order.forEach(function (t) {
+      if (!counts[t]) return;
+      any = true;
+      drawChip(t, counts[t], px, py);
+      px += 40;
+    });
+    if (!any) text('--', px, py, 12, '#b9d6c0');
+  }
+
+  function drawButtons() {
+    var s = game.sim;
+    L.buttons.forEach(function (b) {
+      var label, sub = '', enabled = true, selected = false;
+      if (b.tool) {
+        label = TOOL_NAME[b.tool];
+        if (b.tool === 'sell') sub = '70% back';
+        else sub = sd(HW.costOfTool(b.tool));
+        enabled = b.tool === 'sell' || !s || s.seeds >= HW.costOfTool(b.tool);
+        selected = game.tool === b.tool;
+      } else if (b.id === 'next') {
+        label = 'Next wave';
+        enabled = !!s && s.phase === 'build';
+      } else if (b.id === 'speed') {
+        label = 'x' + game.speed;
+      } else {
+        label = game.paused ? 'Resume' : 'Pause';
+      }
+      ctx.globalAlpha = enabled ? 1 : 0.4;
+      ctx.fillStyle = selected ? '#355c42' : '#1d3a2a';
+      rr(b.x, b.y, b.w, b.h, 10); ctx.fill();
+      ctx.strokeStyle = selected ? '#ffe38a' : 'rgba(180,220,180,0.25)';
+      ctx.lineWidth = selected ? 2 : 1; ctx.stroke();
+      if (sub) {
+        text(label, b.x + b.w / 2, b.y + b.h * 0.36, 13, '#f4f0d8', 'center');
+        text(sub, b.x + b.w / 2, b.y + b.h * 0.7, 11, '#b9d6c0', 'center', '500');
+      } else {
+        text(label, b.x + b.w / 2, b.y + b.h / 2, 13, '#f4f0d8', 'center');
+      }
+      ctx.globalAlpha = 1;
+    });
+  }
+
+  function drawDim(alpha) {
+    ctx.fillStyle = 'rgba(6,12,9,' + alpha + ')';
+    ctx.fillRect(0, 0, W, H);
+  }
+  function panel(w, h) {
+    var x = (W - w) / 2, y = (H - h) / 2;
+    ctx.fillStyle = 'rgba(18,34,26,0.96)';
+    rr(x, y, w, h, 16); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,227,138,0.5)'; ctx.lineWidth = 1.5; ctx.stroke();
+    return { x: x, y: y, w: w, h: h, cx: W / 2 };
+  }
+
+  function drawTitle() {
+    drawDim(0.55);
+    var pw = Math.min(W - 32, 440), ph = Math.min(H - 24, 560);
+    var p = panel(pw, ph), y = p.y + 34, cx = p.cx;
+    text('HEDGEWISE', cx, y, Math.min(38, pw / 9), '#ffe38a', 'center', '800'); y += 34;
+    text('Garden gnomes vs hungry critters', cx, y, 14, '#b9d6c0', 'center'); y += 36;
+    text('How to play', cx, y, 15, '#ffe38a', 'center', '700'); y += 24;
+    ['Hedges reroute the critters.', 'Gnomes sit on hedges and shoot.', 'Never fully block the path.'].forEach(function (t) {
+      text(t, cx, y, 14, '#f4f0d8', 'center'); y += 22;
+    });
+    y += 14;
+    text('Touch: tap a tool, tap a cell, tap again to build.', cx, y, 13, '#cfe3d4', 'center', '500'); y += 20;
+    text('Tap a gnome for its Upgrade and Sell panel.', cx, y, 13, '#cfe3d4', 'center', '500'); y += 20;
+    text('Keys: 1-4 tools, Q sell, arrows/WASD move,', cx, y, 13, '#cfe3d4', 'center', '500'); y += 18;
+    text('Space place, N next wave, F speed, P pause', cx, y, 13, '#cfe3d4', 'center', '500'); y += 30;
+    text('Best: wave ' + game.best.wave + ' · score ' + game.best.score, cx, y, 14, '#ffe38a', 'center'); y += 36;
+    var pulse = 0.6 + 0.4 * Math.sin(time * 4);
+    ctx.globalAlpha = pulse;
+    text('Tap or press Enter to start', cx, y, 17, '#ffffff', 'center', '700');
+    ctx.globalAlpha = 1;
+  }
+
+  function drawPause() {
+    drawDim(0.6);
+    var p = panel(Math.min(W - 32, 340), 180);
+    text('Paused', p.cx, p.y + 46, 28, '#ffe38a', 'center', '800');
+    text('Tap anywhere or press P to resume', p.cx, p.y + 100, 14, '#f4f0d8', 'center');
+    text('Esc and P also pause', p.cx, p.y + 128, 12, '#9bbca6', 'center');
+  }
+
+  function drawOver() {
+    drawDim(0.72);
+    var s = game.sim, sc = HW.score(s);
+    var p = panel(Math.min(W - 32, 380), 350), cx = p.cx, y = p.y + 40;
+    text('Garden overrun', cx, y, 26, '#ff9a8a', 'center', '800'); y += 40;
+    if (game.newBest) { text('New best!', cx, y, 20, '#ffe38a', 'center', '800'); }
+    y += 30;
+    text('Wave reached: ' + s.wave, cx, y, 17, '#f4f0d8', 'center'); y += 28;
+    text('Kills: ' + s.kills, cx, y, 16, '#f4f0d8', 'center'); y += 26;
+    text('Score: ' + sc, cx, y, 16, '#ffe38a', 'center'); y += 26;
+    text('Best: wave ' + game.best.wave + ' · score ' + game.best.score, cx, y, 13, '#b9d6c0', 'center'); y += 44;
+    ctx.fillStyle = '#355c42';
+    rr(cx - 110, y - 22, 220, 44, 12); ctx.fill();
+    text('Play again', cx, y, 17, '#ffffff', 'center', '700');
+    y += 34;
+    text('Tap, or press Enter', cx, y, 12, '#9bbca6', 'center');
+  }
+
+  function render() {
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.fillStyle = '#0c1510';
+    ctx.fillRect(0, 0, W, H);
+    ctx.save();
+    if (shake > 0) ctx.translate((Math.random() - 0.5) * 2 * shake, (Math.random() - 0.5) * 2 * shake);
+    if (game.sim) drawBoard();
+    ctx.restore();
+    if (game.sim) {
+      drawHUD();
+      drawButtons();
+      drawGnomePanel();
+    }
+    if (game.screen === 'over') drawOver();
+    else if (game.paused) drawPause();
+    else if (game.screen === 'title') drawTitle();
+  }
+
+  /* ---------- boot ---------- */
+  window.__game = { state: 'title', score: 0 };
+  game.sim = HW.newGame(12345);          // static backdrop for the title screen
+  game.sim.fx = [];
+  resize();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
