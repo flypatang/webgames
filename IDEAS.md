@@ -16,3 +16,4 @@ Check this before pitching so concepts and genres stay varied.
 - orbit-courier: a respawn-caused retarget shouldn't reset the combo; the THRUST_A comment (line 34) is stale.
 - pulse-garden: the results-screen plants are limited by the lane-width clamp (the 1.9× scale has little visible effect); consider a wider results layout.
 - pulse-garden: a hold released during pause is dropped on resume (acceptable; could keep it until a re-press).
+- candle-crypt: the pause overlay's Resume button uses full-width parentheses （P / Esc）; switch to ASCII.

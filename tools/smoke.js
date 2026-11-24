@@ -15,8 +15,8 @@ const { pathToFileURL } = require('url');
 const { chromium } = require('playwright');
 
 const PASSES = [
-  { name: 'desktop', viewport: { width: 960, height: 640 }, touch: false },
-  { name: 'mobile', viewport: { width: 375, height: 667 }, touch: true },
+  { name: 'desktop', viewport: { width: 960, height: 640 }, touch: false, dpr: 1, isMobile: false },
+  { name: 'mobile', viewport: { width: 375, height: 667 }, touch: true, dpr: 3, isMobile: true },
 ];
 const PLAY_MS = 6000;
 const ACTION_KEYS = ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Space', 'KeyW', 'KeyA', 'KeyS', 'KeyD'];
@@ -68,7 +68,8 @@ async function runPass(browser, gameDir, pass, seed) {
     context = await browser.newContext({
       viewport: pass.viewport,
       hasTouch: pass.touch,
-      deviceScaleFactor: 1,
+      isMobile: pass.isMobile,
+      deviceScaleFactor: pass.dpr,
     });
     const page = await context.newPage();
     page.on('console', (msg) => {
@@ -107,6 +108,31 @@ async function runPass(browser, gameDir, pass, seed) {
     // 2. Canvas present.
     const hasCanvas = (await page.locator('canvas').count()) > 0;
     check('<canvas> present', hasCanvas, hasCanvas ? '' : 'no <canvas> element');
+
+    // 2b. Canvas fits the viewport: its CSS box lies inside the window (1 px slack) and the page
+    // does not scroll horizontally. A canvas whose CSS size is its backing-store size (or CSS
+    // size x DPR) overflows on high-DPR phones.
+    if (hasCanvas) {
+      const fit = await page
+        .evaluate(() => {
+          const c = document.querySelector('canvas');
+          const r = c.getBoundingClientRect();
+          const vw = window.innerWidth;
+          const vh = window.innerHeight;
+          const sw = document.documentElement.scrollWidth;
+          const problems = [];
+          if (r.left < -1 || r.top < -1 || r.right > vw + 1 || r.bottom > vh + 1) {
+            problems.push(
+              `canvas box ${Math.round(r.width)}x${Math.round(r.height)} at (${Math.round(r.left)},${Math.round(r.top)}) ` +
+                `exceeds viewport ${vw}x${vh}`
+            );
+          }
+          if (sw > vw) problems.push(`scrollWidth ${sw} > innerWidth ${vw}`);
+          return { ok: problems.length === 0, detail: problems.join('; ') };
+        })
+        .catch((e) => ({ ok: false, detail: `evaluate failed: ${e.message.split('\n')[0]}` }));
+      check('canvas fits viewport', fit.ok, fit.detail);
+    }
 
     // 3. window.__game with state and score, within 2s.
     let gameReady = false;
