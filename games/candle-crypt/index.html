@@ -1,0 +1,1527 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<link rel="icon" href="data:,">
+<title>Candle Crypt</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0d0b10; overflow: hidden; }
+  body { -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+  canvas { position: fixed; left: 0; top: 0; display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* ==========================================================================
+   CANDLE CRYPT
+   Turn-based roguelike. Your candle is your HP and your clock.
+   Sections: PURE LOGIC (map, FOV, turns, enemies, relics, wax; no DOM, rng injected)
+             then UI (layout, input, audio, rendering, main loop).
+   ========================================================================== */
+
+// ===== PURE LOGIC BEGIN =====
+const GRID_W = 15;
+const GRID_H = 15;
+const GRID_N = GRID_W * GRID_H;
+const T_WALL = 0, T_FLOOR = 1, T_STAIRS = 2, T_WAX = 3, T_CHEST = 4, T_SCONCE = 5;
+const DIRS = [[0, -1], [1, 0], [0, 1], [-1, 0]];
+const DIRS8 = [[0, -1], [1, 0], [0, 1], [-1, 0], [1, -1], [1, 1], [-1, 1], [-1, -1]];
+const MAX_WAX = 100;
+const START_WAX = 100;
+const STEP_COST = 1;
+const DRIP_VALUE = 12;
+const STAIRS_BONUS = 8;
+const SCONCE_COST = 5;
+const SCONCE_RADIUS = 4;
+const CANDLE_BASE = 2;
+const PLAYER_DMG = 2;
+const REVEAL_BONUS = 1;
+const CHASE_RANGE = 6;
+const ARCHER_RANGE = 5;
+const MAX_ENEMIES = 10;
+const SPAWN_MIN_DIST = 5;   // spawns are >4 tiles from start (Chebyshev and walking distance)
+const SMOKE_TURNS = 3;
+const LOG_MAX = 60;
+
+// Enemy rules. dmg = wax lost per hit (wisp-eater: wax drained per turn while adjacent, no hit).
+const ENEMY_DEFS = {
+  rat:    { name: 'Rat',         by: 'a Rat',         hp: 2, dmg: 4, minFloor: 1, weight: 3 },
+  ghoul:  { name: 'Ghoul',       by: 'a Ghoul',       hp: 5, dmg: 8, minFloor: 2, weight: 2 },
+  wisp:   { name: 'Wisp-eater',  by: 'a Wisp-eater',  hp: 3, dmg: 3, minFloor: 3, weight: 2 },
+  archer: { name: 'Bone archer', by: 'a Bone archer', hp: 3, dmg: 4, minFloor: 4, weight: 2 },
+};
+
+const RELIC_DEFS = {
+  ember:   { name: 'Ember Blade',  kind: 'passive', glyph: 'E', text: '+1 attack' },
+  ward:    { name: 'Tallow Ward',  kind: 'passive', glyph: 'W', text: 'The first hit each floor deals 0' },
+  wick:    { name: 'Long Wick',    kind: 'passive', glyph: 'L', text: 'Step cost only every 2nd turn' },
+  mirror:  { name: 'Mirror Shard', kind: 'active',  glyph: 'M', text: 'Swap places with a visible enemy (1/floor)' },
+  smoke:   { name: 'Smoke Bomb',   kind: 'active',  glyph: 'S', text: 'Enemies lose track for 3 turns (1/floor)' },
+  bellows: { name: 'Bellows',      kind: 'active',  glyph: 'B', text: 'Push adjacent enemies back 2 (1/floor)' },
+};
+const RELIC_IDS = Object.keys(RELIC_DEFS);
+
+// ---- utilities ----
+function makeRng(seed) {
+  let a = (seed >>> 0) || 1;
+  return function next() {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function randInt(rng, lo, hi) { return lo + Math.floor(rng() * (hi - lo + 1)); }
+function shuffleArr(rng, arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    const t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+  }
+  return arr;
+}
+const ix = (x, y) => y * GRID_W + x;
+const inB = (x, y) => x >= 0 && y >= 0 && x < GRID_W && y < GRID_H;
+const manhattan = (ax, ay, bx, by) => Math.abs(ax - bx) + Math.abs(ay - by);
+const isWalkable = (t) => t === T_FLOOR || t === T_STAIRS || t === T_WAX || t === T_CHEST;
+const blocksSight = (t) => t === T_WALL || t === T_SCONCE;
+const candleRadius = (wax) => CANDLE_BASE + Math.ceil(wax / 25);
+
+// ---- line of sight ----
+// One-directional Bresenham from (x0,y0) to (x1,y1); intermediate tiles must not block sight.
+function lineClear(tiles, x0, y0, x1, y1) {
+  const dx = Math.abs(x1 - x0), dy = -Math.abs(y1 - y0);
+  const sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+  let err = dx + dy, x = x0, y = y0;
+  for (let guard = 0; guard < 200; guard++) {
+    if (x === x1 && y === y1) return true;
+    const e2 = 2 * err;
+    if (e2 >= dy) { err += dy; x += sx; }
+    if (e2 <= dx) { err += dx; y += sy; }
+    if (x === x1 && y === y1) return true;
+    if (blocksSight(tiles[ix(x, y)])) return false;
+  }
+  return false;
+}
+// Symmetric: visible only if the line is clear in both directions.
+function los(tiles, x0, y0, x1, y1) {
+  return lineClear(tiles, x0, y0, x1, y1) && lineClear(tiles, x1, y1, x0, y0);
+}
+
+// ---- BFS over walkable tiles; avoid[j]=1 tiles are never entered (origin always counted) ----
+function bfsDist(tiles, sx, sy, avoid) {
+  const dist = new Int16Array(GRID_N).fill(-1);
+  const start = ix(sx, sy);
+  const q = [start];
+  dist[start] = 0;
+  for (let h = 0; h < q.length; h++) {
+    const c = q[h], x = c % GRID_W, y = (c / GRID_W) | 0;
+    for (const [dx, dy] of DIRS) {
+      const nx = x + dx, ny = y + dy;
+      if (!inB(nx, ny)) continue;
+      const j = ix(nx, ny);
+      if (dist[j] >= 0 || !isWalkable(tiles[j]) || (avoid && avoid[j])) continue;
+      dist[j] = dist[c] + 1;
+      q.push(j);
+    }
+  }
+  return dist;
+}
+
+// ---- layout: rooms + L-shaped corridors ----
+function carveL(tiles, a, b) {
+  const x0 = a.cx, y0 = a.cy, x1 = b.cx, y1 = b.cy;
+  for (let x = Math.min(x0, x1); x <= Math.max(x0, x1); x++) tiles[ix(x, y0)] = T_FLOOR;
+  for (let y = Math.min(y0, y1); y <= Math.max(y0, y1); y++) tiles[ix(x1, y)] = T_FLOOR;
+}
+function generateLayout(rng) {
+  for (let attempt = 0; attempt < 500; attempt++) {
+    const tiles = new Uint8Array(GRID_N); // all walls
+    const rooms = [];
+    const target = randInt(rng, 5, 7);
+    for (let tries = 0; tries < 300 && rooms.length < target; tries++) {
+      const w = randInt(rng, 3, 6), h = randInt(rng, 3, 6);
+      const x = randInt(rng, 1, GRID_W - 1 - w), y = randInt(rng, 1, GRID_H - 1 - h);
+      // non-overlapping (spec). Touching rooms are allowed: a 1-tile gap makes 5+ rooms almost impossible in 13x13.
+      if (rooms.some((r) => x < r.x + r.w && r.x < x + w && y < r.y + r.h && r.y < y + h)) continue;
+      rooms.push({ x, y, w, h, cx: x + (w >> 1), cy: y + (h >> 1) });
+      for (let yy = y; yy < y + h; yy++) for (let xx = x; xx < x + w; xx++) tiles[ix(xx, yy)] = T_FLOOR;
+    }
+    // retry until the drawn target is met (fallback to >= 5 after many attempts) so counts stay spread across 5/6/7
+    if (rooms.length < 5 || (rooms.length < target && attempt < 400)) continue;
+    const links = [];
+    for (let i = 1; i < rooms.length; i++) links.push([i - 1, i]);
+    const extra = randInt(rng, 1, 2);
+    for (let k = 0, guard = 0; k < extra && guard < 100; guard++) {
+      const a = randInt(rng, 0, rooms.length - 1), b = randInt(rng, 0, rooms.length - 1);
+      if (Math.abs(a - b) <= 1 || links.some(([p, q]) => (p === a && q === b) || (p === b && q === a))) continue;
+      links.push([a, b]);
+      k++;
+    }
+    for (const [a, b] of links) carveL(tiles, rooms[a], rooms[b]);
+    const d = bfsDist(tiles, rooms[0].cx, rooms[0].cy, null);
+    if (rooms.every((r) => d[ix(r.cx, r.cy)] >= 0)) return { tiles, rooms };
+  }
+  throw new Error('layout failed');
+}
+
+// Stairs, chest, wax, sconces. Returns start/stairs as indices.
+function decorateFloor(rng, lay, floor) {
+  const tiles = lay.tiles, rooms = lay.rooms;
+  const sr = rooms[0];
+  const start = ix(sr.cx, sr.cy);
+  const dist = bfsDist(tiles, sr.cx, sr.cy, null);
+  let stairsR = rooms[1], best = -1;
+  for (let r = 1; r < rooms.length; r++) {
+    const d = dist[ix(rooms[r].cx, rooms[r].cy)];
+    if (d > best) { best = d; stairsR = rooms[r]; }
+  }
+  const stairs = ix(stairsR.cx, stairsR.cy);
+  tiles[stairs] = T_STAIRS;
+
+  const cells = [];
+  for (let j = 0; j < GRID_N; j++) if (tiles[j] === T_FLOOR && j !== start) cells.push(j);
+  shuffleArr(rng, cells);
+  let k = 0;
+  tiles[cells[k++]] = T_CHEST;
+  // spec: 3-5 drips per floor, minus 1 per 3 floors, min 2
+  const drips = Math.max(2, randInt(rng, 3, 5) - Math.floor((floor - 1) / 3));
+  for (let d = 0; d < drips && k < cells.length; d++) tiles[cells[k++]] = T_WAX;
+
+  // sconces: wall tiles with an orthogonal walkable neighbour, >= 5 apart
+  const cand = [];
+  for (let y = 1; y < GRID_H - 1; y++) for (let x = 1; x < GRID_W - 1; x++) {
+    const j = ix(x, y);
+    if (tiles[j] !== T_WALL) continue;
+    if (DIRS.some(([dx, dy]) => inB(x + dx, y + dy) && isWalkable(tiles[ix(x + dx, y + dy)]))) cand.push(j);
+  }
+  shuffleArr(rng, cand);
+  const sconces = [];
+  // relax spacing (5, then 3, then any) so there are always two when candidates exist
+  for (const minSep of [5, 3, 0]) {
+    for (const j of cand) {
+      if (sconces.length >= 2) break;
+      const x = j % GRID_W, y = (j / GRID_W) | 0;
+      if (sconces.includes(j)) continue;
+      if (sconces.some((s) => Math.max(Math.abs(s % GRID_W - x), Math.abs(((s / GRID_W) | 0) - y)) < minSep)) continue;
+      sconces.push(j);
+      tiles[j] = T_SCONCE;
+    }
+  }
+  return { tiles, rooms, start, stairs, sconces };
+}
+
+function makeEnemy(g, type, x, y, phase) {
+  const def = ENEMY_DEFS[type];
+  return { id: g.nextId++, type, x, y, hp: def.hp, maxHp: def.hp, phase: phase & 1, telegraph: null };
+}
+function spawnEnemies(g, tiles, start, floor) {
+  const sx = start % GRID_W, sy = (start / GRID_W) | 0;
+  const dist = bfsDist(tiles, sx, sy, null);
+  // primary candidates: walking distance >= 5; fallback tier: walking distance 4 (only if the primary runs out)
+  const primary = [], fallback = [];
+  for (let j = 0; j < GRID_N; j++) {
+    if (tiles[j] !== T_FLOOR) continue;
+    const x = j % GRID_W, y = (j / GRID_W) | 0;
+    if (Math.max(Math.abs(x - sx), Math.abs(y - sy)) < SPAWN_MIN_DIST) continue;
+    if (dist[j] >= SPAWN_MIN_DIST) primary.push(j);
+    else if (dist[j] >= 4) fallback.push(j);
+  }
+  const cand = shuffleArr(g.rng, primary).concat(shuffleArr(g.rng, fallback));
+  const types = Object.keys(ENEMY_DEFS).filter((t) => ENEMY_DEFS[t].minFloor <= floor);
+  const count = Math.min(MAX_ENEMIES, 3 + floor);
+  const out = [];
+  for (let n = 0; n < count && n < cand.length; n++) {
+    const j = cand[n];
+    let total = 0;
+    for (const t of types) total += ENEMY_DEFS[t].weight;
+    let roll = g.rng() * total, type = types[0];
+    for (const t of types) { roll -= ENEMY_DEFS[t].weight; if (roll < 0) { type = t; break; } }
+    out.push(makeEnemy(g, type, j % GRID_W, (j / GRID_W) | 0, n));
+  }
+  return out;
+}
+
+// ---- state helpers ----
+function log(g, text) {
+  g.log.push(text);
+  if (g.log.length > LOG_MAX) g.log.shift();
+}
+function ev(g, type, data) {
+  g.events.push(Object.assign({ type }, data || {}));
+}
+function enemyAt(g, x, y) {
+  for (const e of g.enemies) if (e.x === x && e.y === y) return e;
+  return null;
+}
+function hasRelic(g, id) {
+  return g.slots.some((s) => s && s.id === id);
+}
+function spendWax(g, amount, kind) {
+  const taken = Math.min(g.wax, amount);
+  g.wax -= taken;
+  g.ledger.spent[kind] += taken;
+  return taken;
+}
+function gainWax(g, amount) {
+  const before = g.wax;
+  g.wax = Math.min(MAX_WAX, g.wax + amount);
+  const applied = g.wax - before;
+  g.ledger.gained += applied;
+  g.ledger.wasted += amount - applied;
+  return applied;
+}
+function scoreOf(g) {
+  return g.floor * 100 + g.kills * 10 + g.relicsFound * 25;
+}
+function die(g, src) {
+  if (g.over) return;
+  g.over = true;
+  g.status = 'gameover';
+  g.chest = null; // a pending chest cannot be chosen after death
+  g.cause = src ? `Snuffed by ${ENEMY_DEFS[src.type].by} on floor ${g.floor}` : `Burned down on floor ${g.floor}`;
+  ev(g, 'death', {});
+  log(g, g.cause + '.');
+}
+function hitPlayer(g, amount, src) {
+  if (g.over) return;
+  if (hasRelic(g, 'ward') && !g.wardSpent) {
+    g.wardSpent = true;
+    ev(g, 'ward', { x: g.player.x, y: g.player.y });
+    log(g, `Tallow Ward swallows the ${ENEMY_DEFS[src.type].name}'s blow.`);
+    return;
+  }
+  const taken = spendWax(g, amount, 'damage');
+  ev(g, 'damage', { amount: taken, x: g.player.x, y: g.player.y });
+  log(g, `The ${ENEMY_DEFS[src.type].name} hits you (-${taken} wax).`);
+  if (g.wax <= 0) die(g, src);
+}
+function drainPlayer(g, amount, src) {
+  if (g.over) return;
+  const taken = spendWax(g, amount, 'drain');
+  ev(g, 'drain', { amount: taken, x: g.player.x, y: g.player.y });
+  log(g, `The Wisp-eater drains ${taken} wax.`);
+  if (g.wax <= 0) die(g, src);
+}
+
+// ---- vision ----
+// Recomputes lit tiles (candle + lit sconces), sconce-only light mask, and marks seen tiles.
+function updateVision(g) {
+  const mask = new Uint8Array(GRID_N);
+  for (const s of g.litSconces) {
+    const sx = s % GRID_W, sy = (s / GRID_W) | 0;
+    for (let dy = -SCONCE_RADIUS; dy <= SCONCE_RADIUS; dy++) for (let dx = -SCONCE_RADIUS; dx <= SCONCE_RADIUS; dx++) {
+      const x = sx + dx, y = sy + dy;
+      if (!inB(x, y) || dx * dx + dy * dy > SCONCE_RADIUS * SCONCE_RADIUS) continue;
+      if (los(g.tiles, sx, sy, x, y)) mask[ix(x, y)] = 1;
+    }
+  }
+  const lit = new Uint8Array(GRID_N);
+  const px = g.player.x, py = g.player.y, r = candleRadius(g.wax);
+  for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++) {
+    const x = px + dx, y = py + dy;
+    if (!inB(x, y) || dx * dx + dy * dy > r * r) continue;
+    if (los(g.tiles, px, py, x, y)) lit[ix(x, y)] = 1;
+  }
+  for (let j = 0; j < GRID_N; j++) {
+    if (mask[j]) lit[j] = 1;
+    if (lit[j]) g.seen[j] = 1;
+  }
+  g.lit = lit;
+  g.sconceMask = mask;
+}
+
+// ---- floors ----
+function enterFloor(g) {
+  const lay = generateLayout(g.rng);
+  const dec = decorateFloor(g.rng, lay, g.floor);
+  g.tiles = dec.tiles;
+  g.rooms = dec.rooms;
+  g.start = dec.start;
+  g.stairs = dec.stairs;
+  g.sconces = dec.sconces;
+  g.litSconces = [];
+  g.player = { x: dec.start % GRID_W, y: (dec.start / GRID_W) | 0 };
+  g.seen = new Uint8Array(GRID_N);
+  g.lit = new Uint8Array(GRID_N);
+  g.sconceMask = new Uint8Array(GRID_N);
+  g.enemies = spawnEnemies(g, g.tiles, dec.start, g.floor);
+  for (const s of g.slots) if (s) s.spent = false;
+  g.wardSpent = false;
+  g.smokeTurns = 0;
+  g.targeting = false;
+  updateVision(g);
+}
+
+function newGame(seed) {
+  const g = {
+    seed: seed >>> 0, rng: makeRng(seed), floor: 1, turn: 0, status: 'playing', over: false, cause: '',
+    wax: START_WAX, kills: 0, relicsFound: 0, slots: [null, null], chest: null,
+    targeting: false, targetSlot: -1, smokeTurns: 0, wardSpent: false,
+    nextId: 1, enemies: [], events: [], log: [],
+    ledger: { gained: 0, wasted: 0, spent: { step: 0, damage: 0, drain: 0, sconce: 0 } },
+    tiles: null, rooms: [], start: 0, stairs: -1, sconces: [], litSconces: [],
+    seen: null, lit: null, sconceMask: null, player: { x: 0, y: 0 },
+  };
+  enterFloor(g);
+  log(g, 'Your candle gutters to life.');
+  return g;
+}
+
+// ---- turn machinery ----
+// Pays the step cost for one player turn (Long Wick: only on even turns).
+function paySteps(g) {
+  g.turn++;
+  if (!hasRelic(g, 'wick') || g.turn % 2 === 0) spendWax(g, STEP_COST, 'step');
+  if (g.wax <= 0) die(g, null);
+}
+// Enemy phase (unless skipped), then vision.
+function endTurn(g, skipEnemies) {
+  if (g.over) return;
+  if (!skipEnemies) enemyPhase(g);
+  if (!g.over) updateVision(g);
+}
+
+function attackEnemy(g, e) {
+  const revealed = g.sconceMask[ix(e.x, e.y)] === 1;
+  const dmg = PLAYER_DMG + (hasRelic(g, 'ember') ? 1 : 0) + (revealed ? REVEAL_BONUS : 0);
+  e.hp -= dmg;
+  ev(g, 'hit', { id: e.id, x: e.x, y: e.y, amount: dmg });
+  if (e.hp <= 0) {
+    g.enemies = g.enemies.filter((x) => x !== e);
+    g.kills++;
+    ev(g, 'kill', { id: e.id, x: e.x, y: e.y });
+    log(g, `You snuff the ${ENEMY_DEFS[e.type].name}.`);
+  } else {
+    log(g, `You strike the ${ENEMY_DEFS[e.type].name} (-${dmg}).`);
+  }
+}
+
+function canEnemyEnter(g, x, y, avoid) {
+  if (!inB(x, y)) return false;
+  const j = ix(x, y);
+  if (!isWalkable(g.tiles[j])) return false;
+  if (avoid && avoid[j]) return false;
+  if (g.player.x === x && g.player.y === y) return false;
+  return !enemyAt(g, x, y);
+}
+function shuffledDirs(g) {
+  return shuffleArr(g.rng, DIRS.slice());
+}
+// One step along decreasing `dist` (dist is a BFS map toward the player).
+function stepEnemy(g, e, dist, avoid) {
+  const cur = dist[ix(e.x, e.y)];
+  let best = null, bestD = cur;
+  for (const [dx, dy] of shuffledDirs(g)) {
+    const nx = e.x + dx, ny = e.y + dy;
+    if (!inB(nx, ny)) continue;
+    const d = dist[ix(nx, ny)];
+    if (d < 0 || d >= bestD) continue;
+    if (!canEnemyEnter(g, nx, ny, avoid)) continue;
+    best = [nx, ny];
+    bestD = d;
+  }
+  if (best) { e.x = best[0]; e.y = best[1]; }
+}
+function wander(g, e, avoid) {
+  if (g.rng() < 0.5) return;
+  const d = DIRS[Math.floor(g.rng() * 4)];
+  const nx = e.x + d[0], ny = e.y + d[1];
+  if (canEnemyEnter(g, nx, ny, avoid)) { e.x = nx; e.y = ny; }
+}
+
+// Archer: resolve last turn's telegraph, else look for a straight line to the player and telegraph it.
+function archerTurn(g, e) {
+  const p = g.player;
+  if (e.telegraph) {
+    const cells = e.telegraph;
+    e.telegraph = null;
+    const hit = cells.includes(ix(p.x, p.y));
+    ev(g, hit ? 'fire' : 'miss', { x: e.x, y: e.y });
+    if (hit) hitPlayer(g, ENEMY_DEFS.archer.dmg, e);
+    return;
+  }
+  if (g.smokeTurns > 0) return;
+  for (const [dx, dy] of DIRS8) {
+    const cells = [];
+    let found = false;
+    for (let k = 1; k <= ARCHER_RANGE; k++) {
+      const x = e.x + dx * k, y = e.y + dy * k;
+      if (!inB(x, y) || blocksSight(g.tiles[ix(x, y)])) break;
+      cells.push(ix(x, y));
+      if (x === p.x && y === p.y) found = true;
+    }
+    if (found) {
+      e.telegraph = cells;
+      ev(g, 'telegraph', { x: e.x, y: e.y, cells });
+      return;
+    }
+  }
+}
+
+function enemyPhase(g) {
+  const dist = bfsDist(g.tiles, g.player.x, g.player.y, null);
+  const wdist = bfsDist(g.tiles, g.player.x, g.player.y, g.sconceMask); // wisps never enter sconce light
+  const smoked = g.smokeTurns > 0;
+  for (const id of g.enemies.map((e) => e.id)) {
+    if (g.over) break;
+    const e = g.enemies.find((x) => x.id === id);
+    if (!e) continue;
+    const def = ENEMY_DEFS[e.type];
+    const i = ix(e.x, e.y);
+    const adj = manhattan(e.x, e.y, g.player.x, g.player.y) === 1;
+    if (e.type === 'archer') { archerTurn(g, e); continue; }
+    if (e.type === 'wisp') {
+      if (adj && !smoked) { drainPlayer(g, def.dmg, e); continue; }
+      if (!smoked && wdist[i] >= 0 && wdist[i] <= CHASE_RANGE) stepEnemy(g, e, wdist, g.sconceMask);
+      else wander(g, e, g.sconceMask);
+      continue;
+    }
+    if (e.type === 'ghoul' && (g.turn + e.phase) % 2 !== 0) continue; // ghouls act every other turn
+    if (adj && !smoked) { hitPlayer(g, def.dmg, e); continue; }
+    if (!smoked && dist[i] >= 0 && dist[i] <= CHASE_RANGE) stepEnemy(g, e, dist, null);
+    else wander(g, e, null);
+  }
+  if (g.smokeTurns > 0) g.smokeTurns--;
+}
+
+// ---- player actions ----
+function tryMove(g, dx, dy) {
+  const p = g.player;
+  const nx = p.x + dx, ny = p.y + dy;
+  if (!inB(nx, ny)) return false;
+  const j = ix(nx, ny), t = g.tiles[j];
+  const foe = enemyAt(g, nx, ny);
+  if (foe) {
+    attackEnemy(g, foe);
+    paySteps(g);
+    endTurn(g, false);
+    return true;
+  }
+  if (t === T_SCONCE) {
+    if (g.litSconces.includes(j)) return false;
+    if (g.wax <= SCONCE_COST + 1) { log(g, 'Too little wax to spare for a sconce.'); return false; }
+    g.litSconces.push(j);
+    spendWax(g, SCONCE_COST, 'sconce');
+    ev(g, 'sconce', { x: nx, y: ny });
+    log(g, 'You light the sconce. The crypt shows its bones.');
+    paySteps(g);
+    endTurn(g, false);
+    return true;
+  }
+  if (t === T_WALL) return false;
+  p.x = nx;
+  p.y = ny;
+  return landOn(g);
+}
+
+// Resolves the tile the player now stands on (after a move or a mirror swap). Always takes the turn.
+function landOn(g) {
+  const p = g.player, j = ix(p.x, p.y), t = g.tiles[j];
+  if (t === T_WAX) {
+    gainWax(g, DRIP_VALUE);
+    g.tiles[j] = T_FLOOR;
+    ev(g, 'pickup', { amount: DRIP_VALUE, x: p.x, y: p.y });
+    log(g, `A wax drip: +${DRIP_VALUE}.`);
+  }
+  if (t === T_CHEST) {
+    g.tiles[j] = T_FLOOR;
+    openChest(g);
+  }
+  if (t === T_STAIRS) {
+    paySteps(g);
+    if (g.over) return true;
+    gainWax(g, STAIRS_BONUS);
+    ev(g, 'descend', { floor: g.floor + 1 });
+    g.floor++;
+    enterFloor(g);
+    log(g, `You descend to floor ${g.floor}. +${STAIRS_BONUS} wax.`);
+    return true;
+  }
+  paySteps(g);
+  endTurn(g, false);
+  return true;
+}
+
+function openChest(g) {
+  const pool = shuffleArr(g.rng, RELIC_IDS.slice());
+  g.chest = { options: pool.slice(0, 3), stage: 'pick', pick: null };
+  ev(g, 'chest', {});
+  log(g, 'A relic chest. Choose one.');
+}
+function chooseChest(g, index) {
+  const c = g.chest;
+  if (!c) return false;
+  if (c.stage === 'pick') {
+    const id = c.options[index];
+    if (!id) return false;
+    g.relicsFound++;
+    const empty = g.slots.findIndex((s) => !s);
+    if (empty >= 0) {
+      g.slots[empty] = { id, spent: false };
+      log(g, `You take the ${RELIC_DEFS[id].name}.`);
+      g.chest = null;
+    } else {
+      c.stage = 'slot';
+      c.pick = id;
+    }
+    return true;
+  }
+  if (index < 0 || index > 1) return false;
+  const old = g.slots[index];
+  g.slots[index] = { id: c.pick, spent: false };
+  log(g, `${RELIC_DEFS[c.pick].name} replaces ${old ? RELIC_DEFS[old.id].name : 'nothing'}.`);
+  g.chest = null;
+  return true;
+}
+
+function bellowsPush(g) {
+  const p = g.player;
+  for (const e of g.enemies.slice()) {
+    if (manhattan(e.x, e.y, p.x, p.y) !== 1) continue;
+    const dx = e.x - p.x, dy = e.y - p.y;
+    for (let k = 0; k < 2; k++) {
+      const nx = e.x + dx, ny = e.y + dy;
+      if (!canEnemyEnter(g, nx, ny, null)) break;
+      e.x = nx;
+      e.y = ny;
+    }
+  }
+}
+
+function useRelic(g, slot) {
+  const s = g.slots[slot];
+  if (!s) { log(g, 'That relic slot is empty.'); return false; }
+  const def = RELIC_DEFS[s.id];
+  if (def.kind === 'passive') { log(g, `${def.name} works on its own.`); return false; }
+  if (s.spent) { log(g, `${def.name} is spent for this floor.`); return false; }
+  if (s.id === 'mirror') {
+    if (!g.enemies.some((e) => g.lit[ix(e.x, e.y)])) { log(g, 'No enemy in sight to swap with.'); return false; }
+    g.targeting = true;
+    g.targetSlot = slot;
+    return false;
+  }
+  if (s.id === 'bellows' && !g.enemies.some((e) => manhattan(e.x, e.y, g.player.x, g.player.y) === 1)) {
+    log(g, 'Bellows: nothing adjacent to push. Not used.');
+    return false;
+  }
+  s.spent = true;
+  if (s.id === 'smoke') {
+    g.smokeTurns = SMOKE_TURNS;
+    ev(g, 'smoke', {});
+    log(g, 'Smoke bursts. The dead lose your scent.');
+  } else if (s.id === 'bellows') {
+    bellowsPush(g);
+    ev(g, 'bellows', {});
+    log(g, 'Bellows: the nearby dead are blown back.');
+  }
+  paySteps(g);
+  endTurn(g, false);
+  return true;
+}
+
+function mirrorSwap(g, enemyId) {
+  const s = g.slots[g.targetSlot];
+  g.targeting = false;
+  const e = g.enemies.find((x) => x.id === enemyId);
+  if (!s || s.id !== 'mirror' || s.spent || !e || !g.lit[ix(e.x, e.y)]) return false;
+  const p = g.player;
+  const ox = p.x, oy = p.y;
+  p.x = e.x; p.y = e.y;
+  e.x = ox; e.y = oy;
+  s.spent = true;
+  ev(g, 'swap', { x: p.x, y: p.y });
+  log(g, `Mirror Shard: you trade places with the ${ENEMY_DEFS[e.type].name}.`);
+  return landOn(g);
+}
+
+// Single entry point for all player input. Returns {turned} (true if a turn was taken).
+function act(g, a) {
+  g.events = [];
+  if (g.over) return { turned: false };
+  if (g.chest) {
+    if (a.type === 'choose') chooseChest(g, a.index);
+    return { turned: false };
+  }
+  if (g.targeting) {
+    if (a.type === 'target') return { turned: mirrorSwap(g, a.enemyId) };
+    if (a.type === 'cancel' || (a.type === 'relic' && a.slot === g.targetSlot)) {
+      g.targeting = false;
+      return { turned: false };
+    }
+    g.targeting = false; // any other action cancels the aim
+  }
+  switch (a.type) {
+    case 'move': return { turned: tryMove(g, a.dx, a.dy) };
+    case 'wait': paySteps(g); endTurn(g, false); return { turned: true };
+    case 'relic': return { turned: useRelic(g, a.slot) };
+    default: return { turned: false };
+  }
+}
+
+// ---- known-map pathing (for auto-walk and the bot). Only seen, walkable, unoccupied tiles. ----
+function knownInfo(g) {
+  const dist = new Int16Array(GRID_N).fill(-1);
+  const prev = new Int16Array(GRID_N).fill(-1);
+  const occ = new Uint8Array(GRID_N);
+  for (const e of g.enemies) occ[ix(e.x, e.y)] = 1;
+  const start = ix(g.player.x, g.player.y);
+  const q = [start];
+  dist[start] = 0;
+  for (let h = 0; h < q.length; h++) {
+    const c = q[h], x = c % GRID_W, y = (c / GRID_W) | 0;
+    for (const [dx, dy] of DIRS) {
+      const nx = x + dx, ny = y + dy;
+      if (!inB(nx, ny)) continue;
+      const j = ix(nx, ny);
+      if (dist[j] >= 0 || !g.seen[j] || !isWalkable(g.tiles[j]) || occ[j]) continue;
+      dist[j] = dist[c] + 1;
+      prev[j] = c;
+      q.push(j);
+    }
+  }
+  return { dist, prev, start };
+}
+// First step [dx,dy] on the shortest known path to (tx,ty), or null.
+function firstStepTo(g, tx, ty) {
+  const info = knownInfo(g);
+  const tj = ix(tx, ty);
+  if (tj === info.start || info.dist[tj] < 0) return null;
+  let c = tj;
+  while (info.prev[c] !== info.start) c = info.prev[c];
+  return [(c % GRID_W) - g.player.x, ((c / GRID_W) | 0) - g.player.y];
+}
+// ===== PURE LOGIC END =====
+
+// ==========================================================================
+// UI: layout, input, audio, rendering, main loop
+// ==========================================================================
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const BEST_KEY = 'candleCrypt.best';
+const DIRKEYS = {
+  ArrowUp: [0, -1], KeyW: [0, -1], ArrowDown: [0, 1], KeyS: [0, 1],
+  ArrowLeft: [-1, 0], KeyA: [-1, 0], ArrowRight: [1, 0], KeyD: [1, 0],
+};
+const RELIC_KEYS = { Digit1: 0, Numpad1: 0, Digit2: 1, Numpad2: 1 };
+const CHOOSE_KEYS = { Digit1: 0, Numpad1: 0, Digit2: 1, Numpad2: 1, Digit3: 2, Numpad3: 2 };
+
+let mode = 'title';          // title | playing | paused | gameover
+let game = null;
+let best = loadBest();
+let L = {};                  // layout (CSS px)
+let hits = [];               // tap regions for this frame
+let walk = null;             // auto-walk state
+let targetCursor = 0;
+let shakeMs = 0, vigMs = 0, vigKind = 'dmg', fadeMs = 0;
+let timeMs = 0, lastFrame = 0, heartMs = 0;
+let heldKey = null, heldAcc = 0, heldFirst = true; // held movement key: repeats at ~110 ms (220 ms first)
+const flashUntil = new Map();
+const floaters = [];
+const particles = [];
+const anims = new Map();
+
+window.__game = { state: 'title', score: 0, floor: 0 };
+
+function loadBest() {
+  try {
+    const r = JSON.parse(localStorage.getItem(BEST_KEY) || 'null');
+    if (r && typeof r.floor === 'number') return { floor: r.floor | 0, score: r.score | 0 };
+  } catch (e) { /* storage unavailable */ }
+  return { floor: 0, score: 0 };
+}
+function saveBest() {
+  try { localStorage.setItem(BEST_KEY, JSON.stringify(best)); } catch (e) { /* storage unavailable */ }
+}
+
+// ---- layout ----
+function layout() {
+  const W = window.innerWidth, H = window.innerHeight;
+  const dpr = Math.min(window.devicePixelRatio || 1, 3);
+  canvas.width = Math.round(W * dpr);
+  canvas.height = Math.round(H * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const TOP = 56, LOG = 64;
+  const areaH = Math.max(120, H - TOP - LOG);
+  const T = Math.max(6, Math.floor(Math.min((W - 20) / GRID_W, (areaH - 16) / GRID_H)));
+  const bw = T * GRID_W;
+  L = {
+    W, H, T, bw, TOP, LOG,
+    bx: Math.floor((W - bw) / 2),
+    by: TOP + Math.floor((areaH - bw) / 2),
+    logY: H - LOG,
+    pause: { x: W - 44, y: 11, w: 34, h: 34 },
+    slots: [{ x: W - 126, y: 11, w: 34, h: 34 }, { x: W - 86, y: 11, w: 34, h: 34 }],
+  };
+}
+window.addEventListener('resize', layout);
+
+function hitAt(x, y) {
+  for (let i = hits.length - 1; i >= 0; i--) {
+    const h = hits[i];
+    if (x >= h.x && x <= h.x + h.w && y >= h.y && y <= h.y + h.h) return h;
+  }
+  return null;
+}
+
+// ---- audio (WebAudio, created only after the first user input) ----
+let AC = null;
+function audioUnlock() {
+  try {
+    if (!AC) {
+      const C = window.AudioContext || window.webkitAudioContext;
+      if (C) AC = new C();
+    }
+    if (AC && AC.state === 'suspended') AC.resume();
+  } catch (e) { AC = null; }
+}
+function tone(f0, f1, dur, type, vol, delay) {
+  if (!AC) return;
+  try {
+    const t = AC.currentTime + (delay || 0);
+    const o = AC.createOscillator(), gn = AC.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(f0, t);
+    if (f1) o.frequency.exponentialRampToValueAtTime(f1, t + dur);
+    gn.gain.setValueAtTime(vol, t);
+    gn.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(gn); gn.connect(AC.destination);
+    o.start(t); o.stop(t + dur + 0.05);
+  } catch (e) { /* audio is best-effort */ }
+}
+const sfx = {
+  hit: () => tone(220, 110, 0.09, 'square', 0.08),
+  hurt: () => tone(140, 60, 0.18, 'sawtooth', 0.12),
+  kill: () => tone(520, 180, 0.2, 'triangle', 0.1),
+  drip: () => tone(1600, 2400, 0.06, 'sine', 0.07),
+  chime: () => { tone(880, 880, 0.15, 'sine', 0.07); tone(1320, 1320, 0.18, 'sine', 0.05, 0.08); },
+  descend: () => tone(300, 900, 0.5, 'triangle', 0.1),
+  tele: () => tone(700, 700, 0.08, 'square', 0.03),
+  shot: () => tone(900, 300, 0.12, 'sawtooth', 0.06),
+  heart: () => { tone(70, 50, 0.12, 'sine', 0.25); tone(70, 50, 0.12, 'sine', 0.2, 0.18); },
+  death: () => tone(330, 40, 1.0, 'sawtooth', 0.15),
+  clink: () => tone(1800, 1200, 0.1, 'square', 0.05),
+};
+
+// ---- game flow ----
+function startGame() {
+  audioUnlock();
+  const seed = (Math.random() * 0x7fffffff) | 0 || 1;
+  game = newGame(seed);
+  mode = 'playing';
+  walk = null;
+  targetCursor = 0;
+  heartMs = 0;
+  anims.clear();
+  flashUntil.clear();
+  floaters.length = 0;
+  particles.length = 0;
+  shakeMs = vigMs = fadeMs = 0;
+}
+function visibleEnemyIds() {
+  return game.enemies.filter((e) => game.lit[ix(e.x, e.y)]).map((e) => e.id);
+}
+function afterAction() {
+  for (const e of game.events) juice(e);
+  // auto-walk stops on damage, drain or descend
+  if (game.events.some((e) => e.type === 'damage' || e.type === 'drain' || e.type === 'descend')) walk = null;
+  if (game.over) {
+    mode = 'gameover';
+    walk = null;
+    best.floor = Math.max(best.floor, game.floor);
+    best.score = Math.max(best.score, scoreOf(game));
+    saveBest();
+  }
+}
+// Every player action goes through here: manual input cancels auto-walk.
+function manual(a) {
+  walk = null;
+  if (!game || mode !== 'playing') return;
+  act(game, a);
+  afterAction();
+}
+
+// ---- juice (render-only reactions to logic events) ----
+function floatText(x, y, text, color) { floaters.push({ x, y, text, color, born: timeMs }); }
+function spawnParticles(x, y, color, n) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, s = 1 + Math.random() * 2.5;
+    particles.push({ x: x + 0.5, y: y + 0.5, vx: Math.cos(a) * s, vy: Math.sin(a) * s, born: timeMs, life: 380 + Math.random() * 200, color });
+  }
+}
+function juice(e) {
+  switch (e.type) {
+    case 'hit': flashUntil.set(e.id, timeMs + 140); floatText(e.x, e.y, `-${e.amount}`, '#fff4d6'); sfx.hit(); break;
+    case 'kill': spawnParticles(e.x, e.y, '#ffe7a0', 14); sfx.kill(); break;
+    case 'damage': shakeMs = 200; vigMs = 700; vigKind = 'dmg'; floatText(e.x, e.y, `-${e.amount}`, '#ff6b6b'); sfx.hurt(); break;
+    case 'drain': vigMs = 500; vigKind = 'drain'; floatText(e.x, e.y, `-${e.amount}`, '#9fd3ff'); break;
+    case 'ward': floatText(e.x, e.y, '0', '#9fd3ff'); sfx.clink(); break;
+    case 'pickup': floatText(e.x, e.y, `+${e.amount}`, '#bff5c2'); sfx.drip(); break;
+    case 'sconce': case 'chest': sfx.chime(); break;
+    case 'descend': fadeMs = 600; sfx.descend(); anims.clear(); flashUntil.clear(); floaters.length = 0; break;
+    case 'telegraph': sfx.tele(); break;
+    case 'fire': shakeMs = 120; sfx.shot(); break;
+    case 'death': sfx.death(); break;
+    default: break;
+  }
+}
+
+// ---- input ----
+window.addEventListener('keydown', (e) => {
+  audioUnlock();
+  const k = e.code;
+  if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space', 'Tab'].includes(k)) e.preventDefault();
+  if (e.repeat) return;
+  if (mode === 'title') { if (k === 'Enter' || k === 'Space') startGame(); return; }
+  if (mode === 'gameover') { if (k === 'Enter' || k === 'Space' || k === 'KeyR') startGame(); return; }
+  if (mode === 'paused') {
+    if (k === 'KeyP' || k === 'Escape') mode = 'playing';
+    else if (k === 'KeyR') startGame();
+    return;
+  }
+  // playing
+  if (k === 'KeyP' || k === 'Escape') {
+    if (game.targeting) { manual({ type: 'cancel' }); return; }
+    mode = 'paused'; walk = null; return;
+  }
+  if (game.chest) {
+    if (k in CHOOSE_KEYS) manual({ type: 'choose', index: CHOOSE_KEYS[k] });
+    return;
+  }
+  if (game.targeting) {
+    if (k === 'Tab') {
+      const ids = visibleEnemyIds();
+      if (ids.length) targetCursor = (targetCursor + 1) % ids.length;
+      return;
+    }
+    if (k === 'Enter' || k === 'Space') {
+      const ids = visibleEnemyIds();
+      if (ids.length) manual({ type: 'target', enemyId: ids[targetCursor % ids.length] });
+      return;
+    }
+  }
+  if (k in DIRKEYS) {
+    const d = DIRKEYS[k];
+    heldKey = k; heldAcc = 0; heldFirst = true;
+    manual({ type: 'move', dx: d[0], dy: d[1] });
+    return;
+  }
+  if (k === 'Space' || k === 'Period' || k === 'NumpadDecimal') { manual({ type: 'wait' }); return; }
+  if (k in RELIC_KEYS) manual({ type: 'relic', slot: RELIC_KEYS[k] });
+});
+
+window.addEventListener('keyup', (e) => { if (e.code === heldKey) heldKey = null; });
+window.addEventListener('blur', () => { heldKey = null; });
+function cssPos(e) {
+  const r = canvas.getBoundingClientRect();
+  return { x: e.clientX - r.left, y: e.clientY - r.top };
+}
+let press = null;
+canvas.addEventListener('pointerdown', (e) => {
+  audioUnlock();
+  const p = cssPos(e);
+  press = { x: p.x, y: p.y };
+});
+canvas.addEventListener('pointerup', (e) => {
+  if (!press) return;
+  const p = cssPos(e);
+  const dx = p.x - press.x, dy = p.y - press.y;
+  press = null;
+  if (Math.max(Math.abs(dx), Math.abs(dy)) >= 24) { onSwipe(dx, dy); return; }
+  onTap(p.x, p.y);
+});
+canvas.addEventListener('pointercancel', () => { press = null; });
+
+function onTap(x, y) {
+  if (mode === 'title') { startGame(); return; }
+  const h = hitAt(x, y);
+  if (h) h.fn(x, y);
+}
+function onSwipe(dx, dy) {
+  if (mode !== 'playing' || !game || game.chest) return;
+  if (game.targeting) { manual({ type: 'cancel' }); return; }
+  if (Math.abs(dx) > Math.abs(dy)) manual({ type: 'move', dx: dx > 0 ? 1 : -1, dy: 0 });
+  else manual({ type: 'move', dx: 0, dy: dy > 0 ? 1 : -1 });
+}
+function boardTap(x, y) {
+  if (mode !== 'playing' || !game || game.chest) return;
+  const tx = Math.floor((x - L.bx) / L.T), ty = Math.floor((y - L.by) / L.T);
+  if (!inB(tx, ty)) return;
+  const j = ix(tx, ty);
+  if (game.targeting) {
+    const e = enemyAt(game, tx, ty);
+    if (e && game.lit[j]) manual({ type: 'target', enemyId: e.id });
+    else manual({ type: 'cancel' });
+    return;
+  }
+  const p = game.player;
+  if (tx === p.x && ty === p.y) { manual({ type: 'wait' }); return; }
+  const dx = tx - p.x, dy = ty - p.y;
+  if (Math.abs(dx) + Math.abs(dy) === 1) { manual({ type: 'move', dx, dy }); return; }
+  if (!game.seen[j]) return;
+  walk = { tx, ty, acc: 120, steps: 0, seen: new Set(visibleEnemyIds()) };
+}
+function tickWalk(dtMs) {
+  walk.acc += dtMs;
+  while (walk && walk.acc >= 120) {
+    walk.acc -= 120;
+    stepWalk();
+  }
+}
+// One auto-walk step. Stops at the target, at a wall of unknown tiles, or when an enemy comes into view.
+function stepWalk() {
+  if (!walk || mode !== 'playing' || !game || game.chest) { walk = null; return; }
+  if (walk.steps > 0 && visibleEnemyIds().some((id) => !walk.seen.has(id))) { walk = null; return; }
+  const p = game.player;
+  if (p.x === walk.tx && p.y === walk.ty) { walk = null; return; }
+  const dir = firstStepTo(game, walk.tx, walk.ty);
+  if (!dir) { walk = null; return; }
+  walk.steps++;
+  const w = walk;
+  act(game, { type: 'move', dx: dir[0], dy: dir[1] });
+  afterAction();
+  if (walk !== w) return;
+  if (game.over || mode !== 'playing') walk = null;
+}
+
+// ---- render helpers ----
+function txt(s, x, y, size, color, align, weight, family) {
+  ctx.font = `${weight || '600'} ${size}px ${family || 'system-ui, -apple-system, "Segoe UI", sans-serif'}`;
+  ctx.fillStyle = color;
+  ctx.textAlign = align || 'left';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(s, x, y);
+}
+function rr(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+function button(label, x, y, w, h, fn, primary) {
+  hits.push({ x, y, w, h, fn });
+  rr(x, y, w, h, 8);
+  ctx.fillStyle = primary === false ? '#2b2333' : '#ffcc66';
+  ctx.fill();
+  txt(label, x + w / 2, y + h / 2, 15, primary === false ? '#f2e6c8' : '#17131c', 'center', '700');
+}
+function panel(x, y, w, h) {
+  rr(x, y, w, h, 12);
+  ctx.fillStyle = 'rgba(13,11,16,0.94)';
+  ctx.fill();
+  ctx.strokeStyle = '#3b3142';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+}
+function dim() {
+  ctx.fillStyle = 'rgba(5,4,8,0.6)';
+  ctx.fillRect(0, 0, L.W, L.H);
+}
+// Candle flame: a warm teardrop with flicker. sputter = low wax.
+function drawFlame(cx, cy, s, wax) {
+  const low = wax < 25;
+  const flick = 1 + 0.08 * Math.sin(timeMs / 70) + 0.05 * Math.sin(timeMs / 23);
+  const amp = low ? (0.5 + 0.5 * Math.sin(timeMs / 41)) : 1;
+  const h = s * flick * (low ? 0.6 + 0.4 * amp : 1);
+  const grd = ctx.createRadialGradient(cx, cy, 0, cx, cy, s * 1.6);
+  grd.addColorStop(0, 'rgba(255,204,102,0.45)');
+  grd.addColorStop(1, 'rgba(255,204,102,0)');
+  ctx.fillStyle = grd;
+  ctx.beginPath(); ctx.arc(cx, cy, s * 1.6, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(cx, cy - h);
+  ctx.bezierCurveTo(cx + s * 0.55, cy - h * 0.35, cx + s * 0.4, cy + s * 0.1, cx, cy + s * 0.15);
+  ctx.bezierCurveTo(cx - s * 0.4, cy + s * 0.1, cx - s * 0.55, cy - h * 0.35, cx, cy - h);
+  ctx.fillStyle = low ? '#ff9a4a' : '#ffe08a';
+  ctx.globalAlpha = low ? 0.6 + 0.4 * amp : 1;
+  ctx.fill();
+  ctx.globalAlpha = 1;
+}
+function drawCandle(cx, cy, w, hgt, frac, flameS) {
+  ctx.fillStyle = '#efe2c0';
+  ctx.fillRect(cx - w / 2, cy - hgt * frac, w, hgt * frac);
+  ctx.fillStyle = '#8c7a5e';
+  ctx.fillRect(cx - w / 2, cy - hgt * frac, w, 2);
+  drawFlame(cx, cy - hgt * frac - flameS * 0.2, flameS, frac * MAX_WAX);
+}
+
+// ---- tile glyphs ----
+function drawStairs(cx, cy, T, lit) {
+  ctx.fillStyle = lit ? '#8f7fa3' : '#4d4259';
+  for (let i = 0; i < 3; i++) {
+    const w = T * (0.6 - i * 0.16), y = cy - T * 0.25 + i * T * 0.18;
+    ctx.fillRect(cx - w / 2, y, w, T * 0.12);
+  }
+}
+function drawDrip(cx, cy, T) {
+  ctx.fillStyle = '#fff1b8';
+  ctx.beginPath();
+  ctx.moveTo(cx, cy - T * 0.28);
+  ctx.quadraticCurveTo(cx + T * 0.24, cy + T * 0.08, cx, cy + T * 0.25);
+  ctx.quadraticCurveTo(cx - T * 0.24, cy + T * 0.08, cx, cy - T * 0.28);
+  ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,0.7)';
+  ctx.fillRect(cx - T * 0.08, cy - T * 0.08, T * 0.06, T * 0.14);
+}
+function drawChest(cx, cy, T) {
+  ctx.fillStyle = '#8a5a2b';
+  ctx.fillRect(cx - T * 0.3, cy - T * 0.14, T * 0.6, T * 0.4);
+  ctx.fillStyle = '#e0b04a';
+  ctx.fillRect(cx - T * 0.3, cy - T * 0.02, T * 0.6, T * 0.06);
+  ctx.fillRect(cx - T * 0.05, cy - T * 0.02, T * 0.1, T * 0.12);
+}
+function drawSconce(cx, cy, T, isLit) {
+  ctx.fillStyle = '#5a4a40';
+  ctx.fillRect(cx - T * 0.15, cy - T * 0.05, T * 0.3, T * 0.22);
+  if (isLit) {
+    ctx.fillStyle = '#ffb14a';
+    ctx.beginPath(); ctx.arc(cx, cy - T * 0.12, T * 0.18 + 0.03 * T * Math.sin(timeMs / 60), 0, Math.PI * 2); ctx.fill();
+  } else {
+    ctx.fillStyle = '#6b5b4e';
+    ctx.beginPath(); ctx.arc(cx, cy - T * 0.12, T * 0.1, 0, Math.PI * 2); ctx.fill();
+  }
+}
+
+// ---- enemy silhouettes ----
+function drawEnemy(e, cx, cy, s, flashing) {
+  const sc = s / 2;
+  ctx.save();
+  ctx.shadowColor = 'rgba(0,0,0,0.95)'; // dark halo for contrast against lit floor
+  ctx.shadowBlur = 3;
+  if (e.type === 'rat') {
+    ctx.fillStyle = '#a69383'; ctx.strokeStyle = '#a69383';
+    ctx.beginPath(); ctx.ellipse(cx, cy + sc * 0.15, sc * 0.5, sc * 0.3, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(cx + sc * 0.45, cy - sc * 0.05, sc * 0.2, 0, Math.PI * 2); ctx.fill();
+    ctx.lineWidth = sc * 0.08;
+    ctx.beginPath(); ctx.moveTo(cx - sc * 0.45, cy + sc * 0.15); ctx.quadraticCurveTo(cx - sc * 0.8, cy - sc * 0.3, cx - sc * 0.7, cy + sc * 0.45); ctx.stroke();
+    ctx.fillStyle = '#ff4040';
+    ctx.beginPath(); ctx.arc(cx + sc * 0.5, cy - sc * 0.1, sc * 0.06, 0, Math.PI * 2); ctx.fill();
+  } else if (e.type === 'ghoul') {
+    ctx.fillStyle = '#6f8f5b'; ctx.strokeStyle = '#6f8f5b';
+    ctx.beginPath(); ctx.moveTo(cx - sc * 0.3, cy - sc * 0.35); ctx.lineTo(cx + sc * 0.3, cy - sc * 0.35);
+    ctx.lineTo(cx + sc * 0.4, cy + sc * 0.6); ctx.lineTo(cx - sc * 0.4, cy + sc * 0.6); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = '#8fa878';
+    ctx.beginPath(); ctx.arc(cx, cy - sc * 0.5, sc * 0.22, 0, Math.PI * 2); ctx.fill();
+    ctx.lineWidth = sc * 0.12;
+    ctx.beginPath(); ctx.moveTo(cx - sc * 0.3, cy - sc * 0.2); ctx.lineTo(cx - sc * 0.7, cy + sc * 0.2); ctx.moveTo(cx + sc * 0.3, cy - sc * 0.2); ctx.lineTo(cx + sc * 0.7, cy + sc * 0.2); ctx.stroke();
+    ctx.fillStyle = '#ffe066';
+    ctx.fillRect(cx - sc * 0.12, cy - sc * 0.55, sc * 0.08, sc * 0.08); ctx.fillRect(cx + sc * 0.06, cy - sc * 0.55, sc * 0.08, sc * 0.08);
+  } else if (e.type === 'wisp') {
+    ctx.fillStyle = 'rgba(140,210,255,0.85)';
+    ctx.beginPath(); ctx.arc(cx, cy - sc * 0.1, sc * 0.45, Math.PI, 0);
+    ctx.quadraticCurveTo(cx + sc * 0.45, cy + sc * 0.4, cx, cy + sc * 0.7);
+    ctx.quadraticCurveTo(cx - sc * 0.45, cy + sc * 0.4, cx - sc * 0.45, cy - sc * 0.1); ctx.fill();
+    ctx.fillStyle = '#e8fbff';
+    ctx.beginPath(); ctx.arc(cx - sc * 0.17, cy - sc * 0.1, sc * 0.07, 0, Math.PI * 2); ctx.arc(cx + sc * 0.17, cy - sc * 0.1, sc * 0.07, 0, Math.PI * 2); ctx.fill();
+  } else {
+    ctx.fillStyle = '#c9b99c'; ctx.strokeStyle = '#8a6b4a';
+    ctx.fillRect(cx - sc * 0.15, cy - sc * 0.1, sc * 0.3, sc * 0.6);
+    ctx.fillStyle = '#e6dcc6';
+    ctx.beginPath(); ctx.arc(cx, cy - sc * 0.3, sc * 0.2, 0, Math.PI * 2); ctx.fill();
+    ctx.lineWidth = sc * 0.1;
+    ctx.beginPath(); ctx.arc(cx + sc * 0.35, cy, sc * 0.4, -1.2, 1.2); ctx.stroke();
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(cx + sc * 0.35 + Math.cos(-1.2) * sc * 0.4, cy + Math.sin(-1.2) * sc * 0.4);
+    ctx.lineTo(cx + sc * 0.35 + Math.cos(1.2) * sc * 0.4, cy + Math.sin(1.2) * sc * 0.4); ctx.stroke();
+  }
+  if (flashing) {
+    ctx.globalAlpha = 0.7;
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath(); ctx.arc(cx, cy, sc * 0.8, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.restore();
+  if (e.hp < e.maxHp) {
+    ctx.fillStyle = '#2b2333';
+    ctx.fillRect(cx - sc * 0.7, cy + sc * 0.75, sc * 1.4, 3);
+    ctx.fillStyle = '#ff8c5a';
+    ctx.fillRect(cx - sc * 0.7, cy + sc * 0.75, sc * 1.4 * (e.hp / e.maxHp), 3);
+  }
+}
+
+// Interpolated render position: logic moves snap, render tweens over 80 ms.
+function tweenPos(key, x, y) {
+  let a = anims.get(key);
+  if (!a) { a = { x0: x, y0: y, x1: x, y1: y, t0: -1 }; anims.set(key, a); }
+  if (a.x1 !== x || a.y1 !== y) {
+    const cur = interpPos(a);
+    a.x0 = cur.x; a.y0 = cur.y; a.x1 = x; a.y1 = y; a.t0 = timeMs;
+  }
+  return interpPos(a);
+}
+function interpPos(a) {
+  if (a.t0 < 0) return { x: a.x1, y: a.y1 };
+  const p = Math.min(1, (timeMs - a.t0) / 80);
+  return { x: a.x0 + (a.x1 - a.x0) * p, y: a.y0 + (a.y1 - a.y0) * p };
+}
+
+// ---- render: HUD ----
+function drawHud() {
+  const { W, TOP } = L;
+  ctx.fillStyle = '#17131c';
+  ctx.fillRect(0, 0, W, TOP);
+  ctx.fillStyle = '#2b2333';
+  ctx.fillRect(0, TOP - 1, W, 1);
+  txt(`FLOOR ${game.floor}`, 12, 19, 14, '#f2e6c8');
+  txt(`SCORE ${scoreOf(game)}`, 12, 39, 11, '#a89bb3');
+  // candle icon: body height tracks wax
+  const frac = Math.max(0, game.wax / MAX_WAX);
+  drawCandle(110, 46, 10, 30, Math.max(0.04, frac), 9);
+  // wax bar
+  const bx = 124, bw = Math.max(40, L.slots[0].x - 12 - bx), by = 18, bh = 16;
+  ctx.fillStyle = '#2b2333';
+  rr(bx, by, bw, bh, 4); ctx.fill();
+  ctx.fillStyle = game.wax < 25 ? '#ff6b4a' : '#ffcc66';
+  rr(bx, by, Math.max(2, bw * frac), bh, 4); ctx.fill();
+  ctx.font = '700 11px system-ui, -apple-system, "Segoe UI", sans-serif';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.lineWidth = 3; ctx.strokeStyle = '#0d0b10'; ctx.lineJoin = 'round';
+  ctx.strokeText(`WAX ${game.wax}/${MAX_WAX}`, bx + bw / 2, by + bh / 2 + 0.5);
+  ctx.fillStyle = '#fff4d6';
+  ctx.fillText(`WAX ${game.wax}/${MAX_WAX}`, bx + bw / 2, by + bh / 2 + 0.5);
+  // relic slots
+  for (let i = 0; i < 2; i++) {
+    const r = L.slots[i], s = game.slots[i];
+    hits.push({ x: r.x, y: r.y, w: r.w, h: r.h, fn: () => manual({ type: 'relic', slot: i }) });
+    rr(r.x, r.y, r.w, r.h, 6);
+    if (!s) {
+      ctx.strokeStyle = '#4a4054'; ctx.setLineDash([3, 3]); ctx.lineWidth = 1; ctx.stroke(); ctx.setLineDash([]);
+    } else {
+      const def = RELIC_DEFS[s.id];
+      ctx.fillStyle = '#241d2b'; ctx.fill();
+      const col = s.spent ? '#6b6070' : def.kind === 'passive' ? '#9fd3ff' : '#ffcc66';
+      txt(def.glyph, r.x + r.w / 2, r.y + r.h / 2 + 1, 17, col, 'center', '700');
+      if (targetingSlot(i)) { ctx.strokeStyle = '#ff8c5a'; ctx.lineWidth = 2; ctx.stroke(); }
+    }
+    txt(`${i + 1}`, r.x + 3, r.y + r.h - 5, 9, '#8d8296', 'left');
+  }
+  // pause
+  const p = L.pause;
+  hits.push({ x: p.x, y: p.y, w: p.w, h: p.h, fn: () => { if (mode === 'playing') { mode = 'paused'; walk = null; } } });
+  rr(p.x, p.y, p.w, p.h, 6); ctx.fillStyle = '#241d2b'; ctx.fill();
+  ctx.fillStyle = '#f2e6c8';
+  ctx.fillRect(p.x + 11, p.y + 10, 4, 14); ctx.fillRect(p.x + 19, p.y + 10, 4, 14);
+}
+function targetingSlot(i) { return game.targeting && game.targetSlot === i; }
+
+// ---- render: board ----
+function candleFlickerR() {
+  return candleRadius(game.wax) + 0.15 * Math.sin(timeMs / 97) + 0.1 * Math.sin(timeMs / 211);
+}
+function drawBoard() {
+  const g = game, T = L.T;
+  const sh = shakeMs > 0 ? 3 * (shakeMs / 200) : 0;
+  const ox = L.bx + (sh ? (Math.random() * 2 - 1) * sh : 0);
+  const oy = L.by + (sh ? (Math.random() * 2 - 1) * sh : 0);
+  const R = candleFlickerR();
+  const p = g.player;
+
+  ctx.save();
+  ctx.beginPath(); ctx.rect(L.bx, L.by, L.bw, L.bw); ctx.clip();
+  ctx.fillStyle = '#050408';
+  ctx.fillRect(L.bx, L.by, L.bw, L.bw);
+
+  for (let y = 0; y < GRID_H; y++) for (let x = 0; x < GRID_W; x++) {
+    const j = ix(x, y);
+    if (!g.seen[j]) continue;
+    const px = ox + x * T, py = oy + y * T;
+    const lit = g.lit[j] === 1;
+    const t = g.tiles[j];
+    const wallish = t === T_WALL || t === T_SCONCE;
+    ctx.fillStyle = wallish ? (lit ? '#1f1928' : '#141019') : (lit ? '#4d4159' : '#221c28');
+    ctx.fillRect(px, py, T, T);
+    if (wallish) {
+      ctx.fillStyle = lit ? '#3f3452' : '#1f1a27';
+      ctx.fillRect(px + 1, py + 1, T - 2, 2);
+    }
+    const cx = px + T / 2, cy = py + T / 2;
+    ctx.globalAlpha = lit ? 1 : 0.5;
+    if (t === T_STAIRS) drawStairs(cx, cy, T, lit);
+    else if (t === T_WAX) drawDrip(cx, cy, T);
+    else if (t === T_CHEST) drawChest(cx, cy, T);
+    else if (t === T_SCONCE) drawSconce(cx, cy, T, g.litSconces.includes(j));
+    ctx.globalAlpha = 1;
+    if (lit) {
+      const d = Math.hypot(x - p.x, y - p.y);
+      let warm = Math.max(0, 1 - d / (R + 0.5)) * 0.22;
+      if (g.sconceMask[j]) warm = Math.max(warm, 0.14);
+      ctx.fillStyle = `rgba(255,204,102,${warm.toFixed(3)})`;
+      ctx.fillRect(px, py, T, T);
+    }
+  }
+
+  // bone archer telegraphs
+  for (const e of g.enemies) {
+    if (!e.telegraph) continue;
+    for (const c of e.telegraph) {
+      if (!g.seen[c]) continue;
+      ctx.fillStyle = `rgba(255,50,50,${(0.2 + 0.08 * Math.sin(timeMs / 60)).toFixed(3)})`;
+      ctx.fillRect(ox + (c % GRID_W) * T, oy + ((c / GRID_W) | 0) * T, T, T);
+    }
+    if (g.lit[ix(e.x, e.y)]) {
+      const last = e.telegraph[e.telegraph.length - 1];
+      ctx.strokeStyle = '#ff4040'; ctx.lineWidth = 2; ctx.setLineDash([4, 3]);
+      ctx.beginPath();
+      ctx.moveTo(ox + (e.x + 0.5) * T, oy + (e.y + 0.5) * T);
+      ctx.lineTo(ox + ((last % GRID_W) + 0.5) * T, oy + (((last / GRID_W) | 0) + 0.5) * T);
+      ctx.stroke(); ctx.setLineDash([]);
+    }
+  }
+
+  // enemies: only drawn when lit
+  for (const e of g.enemies) {
+    const pos = tweenPos('e' + e.id, e.x, e.y);
+    if (!g.lit[ix(e.x, e.y)]) continue;
+    const cx = ox + (pos.x + 0.5) * T, cy = oy + (pos.y + 0.5) * T;
+    if (g.sconceMask[ix(e.x, e.y)]) {
+      ctx.strokeStyle = 'rgba(255,170,74,0.5)'; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.arc(cx, cy, T * 0.46, 0, Math.PI * 2); ctx.stroke();
+    }
+    drawEnemy(e, cx, cy, T * 0.95, (flashUntil.get(e.id) || 0) > timeMs);
+  }
+
+  // player candle
+  const pp = tweenPos('p', p.x, p.y);
+  const pcx = ox + (pp.x + 0.5) * T, pcy = oy + (pp.y + 0.5) * T + T * 0.12;
+  drawCandle(pcx, pcy, T * 0.22, T * 0.5, Math.max(0.2, g.wax / MAX_WAX), T * 0.22);
+
+  // targeting ring
+  if (g.targeting) {
+    const ids = visibleEnemyIds();
+    if (ids.length) {
+      const e = g.enemies.find((x) => x.id === ids[targetCursor % ids.length]);
+      if (e) {
+        ctx.strokeStyle = '#ffcc66'; ctx.lineWidth = 2.5;
+        ctx.beginPath(); ctx.arc(ox + (e.x + 0.5) * T, oy + (e.y + 0.5) * T, T * 0.5, 0, Math.PI * 2); ctx.stroke();
+      }
+    }
+  }
+
+  // floaters and particles (tile units)
+  for (const f of floaters) {
+    const age = (timeMs - f.born) / 600;
+    txt(f.text, ox + (f.x + 0.5) * T, oy + (f.y + 0.5) * T - age * T * 0.9, Math.max(11, T * 0.45), f.color, 'center', '800');
+  }
+  for (const q of particles) {
+    const age = (timeMs - q.born) / q.life;
+    ctx.globalAlpha = Math.max(0, 1 - age);
+    ctx.fillStyle = q.color;
+    ctx.fillRect(ox + q.x * T, oy + q.y * T, 3, 3);
+  }
+  ctx.globalAlpha = 1;
+  ctx.restore();
+
+  if (g.targeting) {
+    ctx.fillStyle = 'rgba(13,11,16,0.85)';
+    ctx.fillRect(L.bx, L.by, L.bw, 22);
+    txt('Mirror Shard: tap a lit enemy (Esc cancels)', L.bx + L.bw / 2, L.by + 11, 12, '#ffcc66', 'center');
+  }
+  if (!g.chest) hits.push({ x: L.bx, y: L.by, w: L.bw, h: L.bw, fn: boardTap });
+}
+
+// ---- render: log ----
+function drawLog() {
+  const y0 = L.logY;
+  ctx.fillStyle = '#17131c';
+  ctx.fillRect(0, y0, L.W, L.LOG);
+  ctx.fillStyle = '#2b2333';
+  ctx.fillRect(0, y0, L.W, 1);
+  const lines = game.log.slice(-3);
+  lines.forEach((s, i) => {
+    const alpha = 0.45 + 0.55 * ((i + 1) / lines.length);
+    txt(s, 12, y0 + 14 + i * 16, 12, `rgba(242,230,200,${alpha.toFixed(2)})`);
+  });
+}
+
+// ---- overlays ----
+function drawChestOverlay() {
+  dim();
+  const c = game.chest;
+  const W = L.W, pw = Math.min(W - 24, 420), x = (W - pw) / 2;
+  const h = c.stage === 'pick' ? 80 + 3 * 64 : 80 + 2 * 64 + 40;
+  const y = Math.max(60, (L.H - h) / 2);
+  panel(x, y, pw, h);
+  if (c.stage === 'pick') {
+    txt('A relic in the chest', W / 2, y + 26, 17, '#ffcc66', 'center', '800');
+    txt('Tap a relic, or press 1 / 2 / 3', W / 2, y + 48, 12, '#a89bb3', 'center');
+    c.options.forEach((id, i) => {
+      const d = RELIC_DEFS[id];
+      const cy = y + 70 + i * 64;
+      button(`${d.glyph}  ${d.name}`, x + 14, cy, pw - 28, 54, () => manual({ type: 'choose', index: i }), true);
+      txt(d.text, x + 30, cy + 40, 11, '#17131c', 'left', '600');
+    });
+  } else {
+    txt('Your slots are full', W / 2, y + 26, 17, '#ffcc66', 'center', '800');
+    txt(`Replace which relic with ${RELIC_DEFS[c.pick].name}?`, W / 2, y + 48, 12, '#a89bb3', 'center');
+    for (let i = 0; i < 2; i++) {
+      const s = game.slots[i];
+      const cy = y + 70 + i * 64;
+      button(`${i + 1}.  ${s ? RELIC_DEFS[s.id].name : 'empty'}`, x + 14, cy, pw - 28, 54, () => manual({ type: 'choose', index: i }), false);
+    }
+  }
+}
+function drawPauseOverlay() {
+  dim();
+  const W = L.W, pw = Math.min(W - 24, 380), x = (W - pw) / 2, y = Math.max(80, L.H / 2 - 130);
+  panel(x, y, pw, 260);
+  txt('Paused', W / 2, y + 34, 24, '#f2e6c8', 'center', '800', 'Georgia, serif');
+  button('Resume  (P / Esc)', x + 30, y + 70, pw - 60, 44, () => { mode = 'playing'; }, true);
+  button('Restart', x + 30, y + 124, pw - 60, 44, () => startGame(), false);
+  txt('Keys: arrows/WASD move, Space wait, 1/2 relics', W / 2, y + 200, 11, '#a89bb3', 'center');
+  txt('Tap: adjacent to move, far to auto-walk, swipe to step', W / 2, y + 220, 11, '#a89bb3', 'center');
+}
+function drawGameOver() {
+  dim();
+  const W = L.W, pw = Math.min(W - 24, 380), x = (W - pw) / 2, y = Math.max(60, L.H / 2 - 170);
+  panel(x, y, pw, 340);
+  txt('The candle is out', W / 2, y + 34, 24, '#ff9a6a', 'center', '800', 'Georgia, serif');
+  txt(game.cause, W / 2, y + 66, 13, '#f2e6c8', 'center');
+  const relics = game.slots.filter(Boolean).map((s) => RELIC_DEFS[s.id].name).join(', ') || 'none';
+  const rows = [
+    ['Floor', game.floor], ['Kills', game.kills], ['Relics', relics], ['Score', scoreOf(game)],
+    ['Best floor', best.floor], ['Best score', best.score],
+  ];
+  rows.forEach((r, i) => {
+    const ry = y + 100 + i * 26;
+    txt(String(r[0]), x + 30, ry, 14, '#a89bb3');
+    txt(String(r[1]), x + pw - 30, ry, 14, '#f2e6c8', 'right', '700');
+  });
+  button('Restart  (Enter)', x + 30, y + 280, pw - 60, 44, () => startGame(), true);
+}
+
+// ---- title ----
+function drawCandleArt(cx, cy, hgt) {
+  drawCandle(cx, cy, hgt * 0.3, hgt, 1, hgt * 0.22);
+}
+// Splits text into lines no wider than maxW (measured with the given font).
+function wrapWords(str, maxW, font) {
+  ctx.font = font;
+  const out = [];
+  let cur = '';
+  for (const word of str.split(' ')) {
+    const t = cur ? cur + ' ' + word : word;
+    if (!cur || ctx.measureText(t).width <= maxW) cur = t;
+    else { out.push(cur); cur = word; }
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+function drawTitle() {
+  const W = L.W, H = L.H;
+  const grd = ctx.createLinearGradient(0, 0, 0, H);
+  grd.addColorStop(0, '#16111d');
+  grd.addColorStop(1, '#050407');
+  ctx.fillStyle = grd;
+  ctx.fillRect(0, 0, W, H);
+  const ts = Math.max(28, Math.min(W / 9, 48));
+  txt('Candle Crypt', W / 2, H * 0.12, ts, '#ffcc66', 'center', '800', 'Georgia, serif');
+  txt('Your candle is your life and your clock.', W / 2, H * 0.12 + ts * 0.9, 13, '#a89bb3', 'center');
+  // candle sits below the subtitle with clearance for its flame
+  const ch = Math.min(H * 0.14, 100);
+  const candleY = H * 0.12 + ts * 0.9 + 16 + ch * 1.31;
+  drawCandleArt(W / 2, candleY, ch);
+  const lines = [
+    ['Move / attack', 'arrows or WASD, swipe, or tap an adjacent tile'],
+    ['Auto-walk', 'tap a seen tile (stops when an enemy appears)'],
+    ['Wait', 'Space or .  /  tap your own tile'],
+    ['Relics', '1 and 2  /  tap a relic slot'],
+    ['Pause', 'P or Esc  /  pause button'],
+  ];
+  // controls block: labels in a left column, descriptions wrapped to the rest, block centered
+  const bwC = Math.min(W - 32, 340), x0 = (W - bwC) / 2;
+  ctx.font = '700 12px system-ui, -apple-system, "Segoe UI", sans-serif';
+  const labelW = Math.max(...lines.map((ln) => ctx.measureText(ln[0]).width)) + 12;
+  let y = candleY + 40;
+  for (const ln of lines) {
+    const rows = wrapWords(ln[1], bwC - labelW, '600 12px system-ui, -apple-system, "Segoe UI", sans-serif');
+    txt(ln[0], x0, y, 12, '#ffcc66', 'left', '700');
+    rows.forEach((r, k) => txt(r, x0 + labelW, y + k * 16, 12, '#f2e6c8', 'left'));
+    y += rows.length * 16 + 8;
+  }
+  txt(`Best: floor ${best.floor} · score ${best.score}`, W / 2, y + 10, 13, '#a89bb3', 'center');
+  const bw = Math.min(W - 40, 260), bh = 46;
+  button('Light the candle', (W - bw) / 2, H - bh - 40, bw, bh, () => startGame(), true);
+  txt('Enter / Space or tap to begin', W / 2, H - 14, 11, '#6b6070', 'center');
+}
+
+// ---- main loop ----
+function render() {
+  hits = [];
+  const { W, H } = L;
+  ctx.fillStyle = '#0d0b10';
+  ctx.fillRect(0, 0, W, H);
+  if (mode === 'title' || !game) { drawTitle(); return; }
+  drawHud();
+  drawBoard();
+  drawLog();
+  if (mode === 'gameover') drawGameOver();
+  else if (mode === 'paused') drawPauseOverlay();
+  else if (game.chest) drawChestOverlay();
+  if (vigMs > 0 && mode !== 'title') {
+    const a = Math.min(0.55, vigMs / 700 * 0.55);
+    const color = vigKind === 'dmg' ? '180,20,30' : '120,170,255';
+    const vg = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.3, W / 2, H / 2, Math.max(W, H) * 0.7);
+    vg.addColorStop(0, 'rgba(0,0,0,0)');
+    vg.addColorStop(1, `rgba(${color},${a.toFixed(3)})`);
+    ctx.fillStyle = vg;
+    ctx.fillRect(0, 0, W, H);
+  }
+  if (fadeMs > 0) {
+    ctx.fillStyle = `rgba(0,0,0,${Math.min(1, fadeMs / 600).toFixed(3)})`;
+    ctx.fillRect(0, 0, W, H);
+  }
+}
+function uiState() {
+  if (mode === 'title') return 'title';
+  if (mode === 'paused') return 'paused';
+  if (mode === 'gameover') return 'gameover';
+  return game && game.chest ? 'choosing' : 'playing';
+}
+function frame(now) {
+  const dtMs = Math.min(50, Math.max(0, now - (lastFrame || now)));
+  lastFrame = now;
+  timeMs += dtMs;
+  if (mode === 'playing' && game) {
+    if (game.chest) walk = null;
+    if (walk) tickWalk(dtMs);
+    if (heldKey && !game.chest && !game.targeting && !game.over) {
+      heldAcc += dtMs;
+      const need = heldFirst ? 220 : 110;
+      if (heldAcc >= need) {
+        heldAcc -= need;
+        heldFirst = false;
+        const d = DIRKEYS[heldKey];
+        manual({ type: 'move', dx: d[0], dy: d[1] });
+      }
+    }
+    if (game.wax < 25 && !game.over) {
+      heartMs -= dtMs;
+      if (heartMs <= 0) { heartMs = 900; sfx.heart(); }
+    }
+  }
+  if (mode !== 'playing') heldKey = null;
+  shakeMs = Math.max(0, shakeMs - dtMs);
+  vigMs = Math.max(0, vigMs - dtMs);
+  fadeMs = Math.max(0, fadeMs - dtMs);
+  for (let i = particles.length - 1; i >= 0; i--) if (timeMs - particles[i].born > particles[i].life) particles.splice(i, 1);
+  for (const q of particles) { q.x += q.vx * dtMs / 400; q.y += q.vy * dtMs / 400; }
+  for (let i = floaters.length - 1; i >= 0; i--) if (timeMs - floaters[i].born > 600) floaters.splice(i, 1);
+  render();
+  window.__game = { state: uiState(), score: game ? scoreOf(game) : 0, floor: game ? game.floor : 0 };
+  requestAnimationFrame(frame);
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && mode === 'playing') { mode = 'paused'; walk = null; }
+});
+window.addEventListener('blur', () => { if (mode === 'playing') { mode = 'paused'; walk = null; } });
+
+layout();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

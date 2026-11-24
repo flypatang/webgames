@@ -25,7 +25,9 @@ The orchestrator never writes game code. The reviewer never edits files.
 - A fixed-timestep update (or a dt clamped to ≤ 50ms) so a tab switch doesn't break the physics.
 - Persist a high score in `localStorage` (inside try/catch).
 - Pause on `P`/`Esc` and on `visibilitychange`.
-- Zero console errors. `requestAnimationFrame` loop only.
+- Overlay priority: game over > pause > any other modal. Every modal must be dismissible by touch, and death/pause must never be hidden behind another modal.
+- Movement keys support key-repeat (throttled) where holding a direction makes sense.
+- Zero console errors. `requestAnimationFrame` for the game loop and rendering (the only allowed exception is a short `setInterval` WebAudio lookahead scheduler).
 - Expose `window.__game = { state, score }` (kept updated) so the smoke test can observe it.
 - Target size is under 1500 lines; readable, with sections commented.
 
