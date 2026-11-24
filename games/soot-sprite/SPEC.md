@@ -17,13 +17,13 @@ Read the next chimney section → wall-jump zig-zag → choose the risky spark l
 (Touch alternative: a "one-thumb mode" toggle on the title: the sprite auto-runs toward the nearest wall and any tap jumps. It must be completable at 375 px.)
 
 ## World
-- Logical width 360 px (the shaft), with a variable viewport height. Generated in **segments** 240 px tall, stacked upward, from a seeded PRNG. Each segment picks a template and is parameterized:
+- Logical width 360 px (the shaft), with a variable viewport height; on wide screens the shaft is pillar-boxed (scale = min(W/360, H/520)). Generated in **segments** 240 px tall, stacked upward, from a seeded PRNG. Each segment picks a template and is parameterized:
   1. Zig-zag ledges (left/right alternating, ledge width 60–100).
   2. Narrow flue (the walls pinch to 90–120 px wide for 200 px: pure wall-jumping).
   3. Crumble ledges (fall 0.5 s after being touched, respawn after 4 s).
   4. Spike vents (a ledge with a fire vent active 1.2 s on / 1.5 s off, telegraphed by a glow 0.4 s before).
   5. Open drop (no walls for a 150 px span: requires a double-jump or a lucky line; always paired with a spark placed mid-span).
-- Template weights by height: only 1–2 for the first 1000 px; then add 3, 4, 5 progressively. A **solvability rule**: any segment's next foothold must be within a reachable envelope (≤ 110 px vertical with a single jump from a ledge or a wall; ≤ 170 px when a spark is guaranteed on the route). Verify with a reachability check during generation; regenerate the segment if it fails.
+- Template weights by height: only 1–2 for the first 1000 px; then add 3, 4, 5 progressively. A **solvability rule**: any segment's next foothold must be within a reachable envelope (≤ 85 px vertical with a single jump from a ledge, ≤ 120 px when a spark is guaranteed on the route; horizontal gaps ≤ 150 px; zig-zag ledges are floating and alternating, with tip gaps ≤ 100 px). Crumble ledges are optional stepping stones, never required. Unlocks: crumble and vents from 1000 px, open drop from 2000 px.. Verify with a reachability check during generation; regenerate the segment if it fails.
 
 ## Physics (fixed 120 Hz step)
 - Gravity 1500 px/s², max fall 700 px/s (wall slide max 140 px/s while pressing into a wall).
@@ -33,7 +33,7 @@ Read the next chimney section → wall-jump zig-zag → choose the risky spark l
 - Hazards: spike vents and the ember tide kill. Landing on a crumble ledge starts its timer.
 
 ## Ember tide
-Starts 300 px below the player and rises at 40 px/s, +4 px/s per 500 px of climbed height (max 150). If the player is more than 600 px above it, it speeds up ×2 until within 450 (rubber-band so it stays threatening). Touching it = death. A heat shimmer + an orange glow + a warning vignette when within 150 px.
+Starts 400 px below the player and rises at 22 px/s, +3 px/s per 500 px of climbed height (max 90). If the player is more than 600 px above it, it speeds up ×2 until within 450 (rubber-band so it stays threatening). Touching it = death. A heat shimmer + an orange glow + a warning vignette when within 150 px.
 
 ## Scoring
 Score = max height climbed (in "meters" = px/10) + 25 per spark. Milestone banners every 100 m. Best height in localStorage `sootSprite.best`, with a "best height" line drawn on the wall during play.
